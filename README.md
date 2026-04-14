@@ -138,7 +138,28 @@ prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
 - `pg_faiss_index_stats(name)`
 - `pg_faiss_index_drop(name)` / `pg_faiss_reset()`
 
+See the API reference for full parameter semantics and error behavior.
+
+## C++ Style
+
+- `src/pg_faiss.cpp` and `src/pg_faiss.h` are formatted to Google C++ style.
+- Style config: `contrib/pg_faiss/.clang-format`.
+- Format locally: `make -C contrib/pg_faiss format`
+- Check formatting: `make -C contrib/pg_faiss format-check`
+
+## GitHub Project Website
+
+- Site source directory: `contrib/pg_faiss/site`
+- Includes language toggle (Chinese/English), project purpose, usage, performance, and doc links.
+- GitHub Pages workflow: `.github/workflows/pg_faiss-pages.yml`
+
+Enable it:
+1. Push to `main` or `master`.
+2. In repository Settings -> Pages, set Source to **GitHub Actions**.
+3. Run `pg_faiss-pages` workflow and use the generated Pages URL.
+
 ## Docs
 
+- API Reference: [docs/api.md](docs/api.md)
 - Design: [docs/design.md](docs/design.md)
 - Usage: [docs/usage.md](docs/usage.md)

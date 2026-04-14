@@ -58,6 +58,8 @@ CREATE EXTENSION pg_faiss;
 
 ## 3. API 示例
 
+完整 API 参数说明请见：[api.zh.md](api.zh.md)。
+
 ### 3.1 创建索引
 
 ```sql

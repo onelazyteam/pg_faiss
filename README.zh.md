@@ -138,7 +138,28 @@ prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
 - `pg_faiss_index_stats(name)`
 - `pg_faiss_index_drop(name)` / `pg_faiss_reset()`
 
+详细参数与错误语义请见 API 参考文档。
+
+## C++ 代码规范
+
+- `src/pg_faiss.cpp` / `src/pg_faiss.h` 按 Google C++ 风格格式化。
+- 规范配置文件：`contrib/pg_faiss/.clang-format`。
+- 本地格式化：`make -C contrib/pg_faiss format`
+- 本地检查：`make -C contrib/pg_faiss format-check`
+
+## GitHub 项目网站
+
+- 站点源码目录：`contrib/pg_faiss/site`
+- 支持中英文切换，覆盖：项目目的、使用示例、性能数据、文档入口。
+- GitHub Pages 工作流：`.github/workflows/pg_faiss-pages.yml`
+
+启用方式：
+1. 推送到 GitHub 仓库（`main` 或 `master`）。
+2. 在仓库 Settings -> Pages 中将 Source 设为 **GitHub Actions**。
+3. 触发 `pg_faiss-pages` workflow 后即可获得站点 URL。
+
 ## 文档
 
+- API 参考：[docs/api.zh.md](docs/api.zh.md)
 - 设计文档：[docs/design.zh.md](docs/design.zh.md)
 - 使用文档：[docs/usage.zh.md](docs/usage.zh.md)

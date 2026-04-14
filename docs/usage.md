@@ -58,6 +58,8 @@ CREATE EXTENSION pg_faiss;
 
 ## 3. API examples
 
+For full per-parameter API semantics, see [api.md](api.md).
+
 ### 3.1 Create index
 
 ```sql

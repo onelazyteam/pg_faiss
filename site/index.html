@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>pg_faiss | FAISS for PostgreSQL</title>
+  <meta name="description" content="pg_faiss: FAISS-based vector search extension for PostgreSQL.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="container">
+      <div class="topbar">
+        <div class="brand">pg_faiss</div>
+        <div class="lang-switch" role="group" aria-label="Language switch">
+          <button id="lang-zh" class="lang-btn active" type="button">中文</button>
+          <button id="lang-en" class="lang-btn" type="button">English</button>
+        </div>
+      </div>
+      <h1>
+        <span class="lang lang-zh">FAISS 驱动的 PostgreSQL 向量检索扩展</span>
+        <span class="lang lang-en">FAISS-powered vector search extension for PostgreSQL</span>
+      </h1>
+      <p class="subtitle">
+        <span class="lang lang-zh">目标：在满足召回约束下，提供高吞吐 ANN 检索能力（CPU/GPU）。</span>
+        <span class="lang lang-en">Goal: deliver high-throughput ANN search on CPU/GPU under strict recall constraints.</span>
+      </p>
+      <div class="cta-row">
+        <a id="repo-link" class="btn" href="https://github.com" target="_blank" rel="noopener">
+          <span class="lang lang-zh">GitHub 仓库</span>
+          <span class="lang lang-en">GitHub Repository</span>
+        </a>
+        <a class="btn ghost" href="#usage">
+          <span class="lang lang-zh">查看文档</span>
+          <span class="lang lang-en">Read Docs</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="purpose" class="card">
+      <h2>
+        <span class="lang lang-zh">项目目的</span>
+        <span class="lang lang-en">Project Purpose</span>
+      </h2>
+      <ul>
+        <li class="lang lang-zh">把 FAISS 检索能力集成到 PostgreSQL，提供函数式向量检索接口。</li>
+        <li class="lang lang-en">Integrate FAISS into PostgreSQL with function-oriented vector search APIs.</li>
+        <li class="lang lang-zh">以 `vector/vector[]` 作为主通道，降低数据转换开销。</li>
+        <li class="lang lang-en">Use `vector/vector[]` as the primary path to reduce conversion overhead.</li>
+        <li class="lang lang-zh">支持 `hnsw` / `ivfflat` / `ivfpq` 及 `l2` / `ip` / `cosine`。</li>
+        <li class="lang lang-en">Support `hnsw` / `ivfflat` / `ivfpq` with `l2` / `ip` / `cosine` metrics.</li>
+      </ul>
+    </section>
+
+    <section id="usage" class="card">
+      <h2>
+        <span class="lang lang-zh">快速使用</span>
+        <span class="lang lang-en">Quick Usage</span>
+      </h2>
+      <pre><code>CREATE EXTENSION vector;
+CREATE EXTENSION pg_faiss;
+
+SELECT pg_faiss_index_create(
+  'docs_hnsw',
+  768,
+  'cosine',
+  'hnsw',
+  '{"m":32,"ef_construction":200,"ef_search":64}'::jsonb,
+  'cpu'
+);
+
+SELECT *
+FROM pg_faiss_index_search(
+  'docs_hnsw',
+  '[0.1,0.2,0.3,...]'::vector,
+  10,
+  '{"ef_search":128}'::jsonb
+);</code></pre>
+    </section>
+
+    <section id="performance" class="card">
+      <h2>
+        <span class="lang lang-zh">性能概览（CPU，批量查询路径）</span>
+        <span class="lang lang-en">Performance Snapshot (CPU, batch query path)</span>
+      </h2>
+      <p>
+        <span class="lang lang-zh">实测环境（2026-04-14）：`20,000 x 128`，`29` queries，`k=10`。</span>
+        <span class="lang lang-en">Measured on 2026-04-14: `20,000 x 128`, `29` queries, `k=10`.</span>
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Scenario</th>
+              <th>pgvector avg_ms</th>
+              <th>pg_faiss(batch) avg_ms</th>
+              <th>Speedup</th>
+              <th>pgvector Recall@10</th>
+              <th>pg_faiss Recall@10</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>HNSW</td>
+              <td>1.13</td>
+              <td>0.10</td>
+              <td>11.32x</td>
+              <td>0.9552</td>
+              <td>1.0000</td>
+            </tr>
+            <tr>
+              <td>IVFFlat</td>
+              <td>0.76</td>
+              <td>0.07</td>
+              <td>10.31x</td>
+              <td>1.0000</td>
+              <td>1.0000</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note">
+        <span class="lang lang-zh">重负载验收基准：`1M x 768`，详见 TAP 测试脚本。</span>
+        <span class="lang lang-en">Heavy acceptance benchmark: `1M x 768`; see TAP benchmark scripts.</span>
+      </p>
+    </section>
+
+    <section class="card grid">
+      <a class="link-card" data-gh-path="contrib/pg_faiss/README.zh.md" href="https://github.com" target="_blank" rel="noopener">
+        <h3>README (ZH)</h3>
+        <p class="lang lang-zh">安装、性能、示例总览</p>
+        <p class="lang lang-en">Install, performance, and usage overview</p>
+      </a>
+      <a class="link-card" data-gh-path="contrib/pg_faiss/README.md" href="https://github.com" target="_blank" rel="noopener">
+        <h3>README (EN)</h3>
+        <p class="lang lang-zh">英文说明入口</p>
+        <p class="lang lang-en">English entry documentation</p>
+      </a>
+      <a class="link-card" data-gh-path="contrib/pg_faiss/docs/api.zh.md" href="https://github.com" target="_blank" rel="noopener">
+        <h3>API</h3>
+        <p class="lang lang-zh">每个接口的参数与语义</p>
+        <p class="lang lang-en">Per-function parameter semantics</p>
+      </a>
+      <a class="link-card" data-gh-path="contrib/pg_faiss/docs/design.zh.md" href="https://github.com" target="_blank" rel="noopener">
+        <h3>Design</h3>
+        <p class="lang lang-zh">架构与性能方法学</p>
+        <p class="lang lang-en">Architecture and performance methodology</p>
+      </a>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <span class="lang lang-zh">pg_faiss v0.2 · GitHub Pages</span>
+      <span class="lang lang-en">pg_faiss v0.2 · GitHub Pages</span>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,55 @@
+name: pg_faiss-linux-cpu-ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  linux-cpu-build-test:
+    runs-on: ubuntu-22.04
+
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            ca-certificates \
+            cmake \
+            git \
+            libfaiss-dev \
+            libpq-dev \
+            postgresql \
+            postgresql-server-dev-all
+
+      - name: Show toolchain versions
+        run: |
+          which pg_config
+          pg_config --version
+          cmake --version
+
+      - name: Build and install pgvector (v0.8.2)
+        run: |
+          git clone --depth 1 --branch v0.8.2 https://github.com/pgvector/pgvector.git /tmp/pgvector
+          make -C /tmp/pgvector PG_CONFIG="$(which pg_config)"
+          sudo make -C /tmp/pgvector PG_CONFIG="$(which pg_config)" install
+
+      - name: Build and install pg_faiss (CPU)
+        working-directory: .
+        run: |
+          make PG_CONFIG="$(which pg_config)"
+          sudo make PG_CONFIG="$(which pg_config)" install
+
+      - name: Run basic regression test
+        working-directory: .
+        run: |
+          make PG_CONFIG="$(which pg_config)" installcheck

@@ -34,6 +34,17 @@ endif
 # for Postgres < 15
 PROVE_FLAGS += -I ./test/perl
 
+CLANG_FORMAT ?= clang-format
+FORMAT_FILES = src/pg_faiss.cpp src/pg_faiss.h
+
 prove_installcheck:
 	rm -rf $(CURDIR)/tmp_check
 	cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" PGPORT='6$(DEF_PGPORT)' PG_REGRESS='$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),test/t/*.pl)
+
+format:
+	$(CLANG_FORMAT) -style=file -i $(FORMAT_FILES)
+
+format-check:
+	$(CLANG_FORMAT) -style=file --dry-run --Werror $(FORMAT_FILES)
+
+.PHONY: prove_installcheck format format-check
