@@ -27,9 +27,19 @@ jobs:
             cmake \
             git \
             libfaiss-dev \
-            libpq-dev \
-            postgresql-18 \
-            postgresql-server-dev-18
+            libpq-dev
+
+      - name: Ensure PostgreSQL build toolchain
+        run: |
+          if command -v pg_config >/dev/null 2>&1; then
+            echo "Using preinstalled PostgreSQL toolchain: $(pg_config --version)"
+          else
+            echo "pg_config not found, installing Ubuntu PostgreSQL toolchain"
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              postgresql \
+              postgresql-server-dev-all
+          fi
 
       - name: Show toolchain versions
         run: |

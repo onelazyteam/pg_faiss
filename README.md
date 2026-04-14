@@ -151,12 +151,13 @@ See the API reference for full parameter semantics and error behavior.
 
 - Site source directory: `contrib/pg_faiss/site`
 - Includes language toggle (Chinese/English), project purpose, usage, performance, and doc links.
-- GitHub Pages workflow: `.github/workflows/pg_faiss-pages.yml`
+- GitHub Pages workflow: `.github/workflows/pages.yml`
 
 Enable it:
 1. Push to `main` or `master`.
 2. In repository Settings -> Pages, set Source to **GitHub Actions**.
-3. Run `pg_faiss-pages` workflow and use the generated Pages URL.
+3. Run `pg_faiss-pages` workflow and use the generated Pages URL (`https://onelazyteam.github.io/pg_faiss/`).
+4. Set this URL in repository **About -> Website** to get one-click navigation like `pg_llm`.
 
 ## Docs
 

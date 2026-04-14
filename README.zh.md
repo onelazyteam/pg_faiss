@@ -151,12 +151,13 @@ prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
 
 - 站点源码目录：`contrib/pg_faiss/site`
 - 支持中英文切换，覆盖：项目目的、使用示例、性能数据、文档入口。
-- GitHub Pages 工作流：`.github/workflows/pg_faiss-pages.yml`
+- GitHub Pages 工作流：`.github/workflows/pages.yml`
 
 启用方式：
 1. 推送到 GitHub 仓库（`main` 或 `master`）。
 2. 在仓库 Settings -> Pages 中将 Source 设为 **GitHub Actions**。
-3. 触发 `pg_faiss-pages` workflow 后即可获得站点 URL。
+3. 触发 `pg_faiss-pages` workflow 后即可获得站点 URL（`https://onelazyteam.github.io/pg_faiss/`）。
+4. 在仓库首页 **About -> Website** 中填入该 URL，即可像 `pg_llm` 一样直接点击跳转。
 
 ## 文档
 
