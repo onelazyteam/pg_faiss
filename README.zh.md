@@ -1,0 +1,144 @@
+# pg_faiss
+
+基于 FAISS 的 PostgreSQL 向量检索扩展（v0.2）。
+
+English version: [README.md](README.md)
+
+## 主要特性
+
+- 基于 `vector` / `vector[]` 的函数式 API
+- 索引类型：`hnsw`、`ivfflat`、`ivfpq`
+- 距离度量：`l2`、`ip`、`cosine`
+- 支持 CPU 路径 + 可选 GPU 路径（`USE_FAISS_GPU=1`）
+- 版本化扩展脚本（`pg_faiss--0.2.0.sql`）
+- 回归测试 + TAP（正确性、召回、性能）
+
+## 对比基线版本
+
+- PostgreSQL：18.3
+- pgvector：0.8.2（`contrib/pgvector/Makefile` 中 `EXTVERSION = 0.8.2`）
+- FAISS：1.14.1（CPU，源码安装）
+
+## 性能对比（pg_faiss vs pgvector）
+
+### 验收目标数据
+
+对比条件：同召回约束（`Recall@10 >= 95%`）、同数据集、同查询集。
+
+| 场景 | 基线（pgvector） | pg_faiss 目标 | 提升目标 |
+|---|---:|---:|---:|
+| CPU ANN（HNSW / IVFFlat） | 1.0x | >= 5.0x | >= 5x |
+| GPU ANN（FAISS GPU 路径） | 1.0x | >= 10.0x | >= 10x |
+
+### 本机 CPU 实测（2026-04-14，批量查询路径）
+
+测试口径：同数据集、同查询集、同召回约束（`Recall@10 >= 95%`），基线为 pgvector 0.8.2。  
+数据规模：`20,000 x 128`，`29` queries，`k=10`。  
+pg_faiss 使用 `pg_faiss_index_search_batch`，pgvector 使用逐条查询循环。
+
+| 场景 | pgvector avg_ms | pg_faiss(batch) avg_ms | Speedup | pgvector Recall@10 | pg_faiss Recall@10 |
+|---|---:|---:|---:|---:|---:|
+| HNSW | 1.13 | 0.10 | 11.32x | 0.9552 | 1.0000 |
+| IVFFlat | 0.76 | 0.07 | 10.31x | 1.0000 | 1.0000 |
+
+说明：
+- 以上是你机器上的一次 CPU 实测数据，用于 README 固化对比结果。
+- 该实测使用参数：pgvector `hnsw.ef_search=512`、`ivfflat.probes=16`；pg_faiss `ef_search=128`、`nprobe=16`。
+- 复现脚本：`contrib/pg_faiss/test/bench/bench_cpu_batch_sample.sql`。
+
+### TAP 重基准脚本（验收用）
+
+| 脚本 | 对比内容 | 默认重载规模 |
+|---|---|---|
+| `test/t/020_perf_cpu_vs_pgvector.pl` | CPU 对比 pgvector（`hnsw`、`ivfflat`） | `1M x 768`，`100` queries |
+| `test/t/030_perf_gpu_vs_pgvector.pl` | GPU 对比 pgvector（`hnsw`） | `1M x 768`，`100` queries |
+
+## 安装 FAISS（CPU）
+
+```bash
+# 依赖（macOS）
+brew install cmake libomp
+
+# 编译安装 FAISS 1.14.1（CPU）
+git clone --branch v1.14.1 https://github.com/facebookresearch/faiss.git
+cd faiss
+cmake -B build \
+  -DFAISS_ENABLE_GPU=OFF \
+  -DBUILD_TESTING=OFF \
+  -DFAISS_ENABLE_PYTHON=OFF \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=$HOME/faiss-install \
+  -DOpenMP_CXX_FLAGS="-Xpreprocessor -fopenmp -I/usr/local/opt/libomp/include" \
+  -DOpenMP_CXX_LIB_NAMES=omp \
+  -DOpenMP_omp_LIBRARY=/usr/local/opt/libomp/lib/libomp.dylib
+cmake --build build -j
+cmake --install build
+```
+
+如果使用 Linux，可去掉上面的 OpenMP macOS 专用参数，保留 `FAISS_ENABLE_GPU=OFF` 即可。
+
+## 快速构建
+
+```bash
+cd contrib/pg_faiss
+make
+make install
+```
+
+如果 FAISS 安装在 `$HOME/faiss-install`（非系统默认路径），可使用：
+
+```bash
+cd contrib/pg_faiss
+make \
+  PG_CPPFLAGS="-I$HOME/faiss-install/include -I/usr/local/opt/libomp/include -std=c++17" \
+  SHLIB_LINK="-L$HOME/faiss-install/lib -lfaiss -L/usr/local/opt/libomp/lib -lomp -framework Accelerate -lc++ -lc++abi -bundle_loader $(pg_config --bindir)/postgres"
+make install
+```
+
+GPU 构建示例：
+
+```bash
+cd contrib/pg_faiss
+make USE_FAISS_GPU=1 FAISS_GPU_LIBS="-lfaiss -lcudart -lcublas"
+make install
+```
+
+## 测试与基准
+
+```bash
+# 回归测试
+make installcheck
+
+# Recall TAP
+prove -I ./test/perl test/t/010_recall.pl
+
+# CPU 性能 TAP（重负载）
+PG_FAISS_RUN_PERF=1 \
+PG_FAISS_PERF_ROWS=1000000 \
+PG_FAISS_PERF_DIM=768 \
+PG_FAISS_PERF_QUERIES=100 \
+prove -I ./test/perl test/t/020_perf_cpu_vs_pgvector.pl
+
+# GPU 性能 TAP（重负载）
+PG_FAISS_RUN_PERF_GPU=1 \
+PG_FAISS_PERF_GPU_ROWS=1000000 \
+PG_FAISS_PERF_GPU_DIM=768 \
+PG_FAISS_PERF_GPU_QUERIES=100 \
+prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
+```
+
+## API
+
+- `pg_faiss_index_create(name, dim, metric, index_type, options, device)`
+- `pg_faiss_index_train(name, training_vectors)`
+- `pg_faiss_index_add(name, ids, vectors)`
+- `pg_faiss_index_search(name, query, k, search_params)`
+- `pg_faiss_index_search_batch(name, queries, k, search_params)`
+- `pg_faiss_index_save(name, path)` / `pg_faiss_index_load(name, path, device)`
+- `pg_faiss_index_stats(name)`
+- `pg_faiss_index_drop(name)` / `pg_faiss_reset()`
+
+## 文档
+
+- 设计文档：[docs/design.zh.md](docs/design.zh.md)
+- 使用文档：[docs/usage.zh.md](docs/usage.zh.md)

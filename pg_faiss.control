@@ -1,0 +1,6 @@
+# pg_faiss extension
+comment = 'FAISS vector similarity search for PostgreSQL'
+default_version = '0.2.0'
+module_pathname = '$libdir/pg_faiss'
+relocatable = false
+requires = 'vector'

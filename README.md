@@ -1,0 +1,144 @@
+# pg_faiss
+
+FAISS-based vector search extension for PostgreSQL (v0.2).
+
+中文文档请见 [README.zh.md](README.zh.md).
+
+## Highlights
+
+- Function-oriented API built around `vector` / `vector[]`
+- Index types: `hnsw`, `ivfflat`, `ivfpq`
+- Metrics: `l2`, `ip`, `cosine`
+- CPU path + optional GPU path (`USE_FAISS_GPU=1`)
+- Versioned extension SQL (`pg_faiss--0.2.0.sql`)
+- Regression + TAP tests (correctness, recall, performance)
+
+## Baseline Versions
+
+- PostgreSQL: 18.3
+- pgvector: 0.8.2 (`EXTVERSION = 0.8.2` in `contrib/pgvector/Makefile`)
+- FAISS: 1.14.1 (CPU build from source)
+
+## Performance Comparison (pg_faiss vs pgvector)
+
+### Acceptance Targets
+
+Benchmarks are evaluated under the same recall constraint (`Recall@10 >= 95%`), same dataset, and same query set.
+
+| Scenario | Baseline (pgvector) | pg_faiss Target | Speedup Target |
+|---|---:|---:|---:|
+| CPU ANN (HNSW / IVFFlat) | 1.0x | >= 5.0x | >= 5x |
+| GPU ANN (FAISS GPU path) | 1.0x | >= 10.0x | >= 10x |
+
+### Measured CPU Results On This Machine (2026-04-14, Batch Query Path)
+
+Method: same dataset, same query set, same recall constraint (`Recall@10 >= 95%`), baseline = pgvector 0.8.2.  
+Scale: `20,000 x 128`, `29` queries, `k=10`.  
+pg_faiss uses `pg_faiss_index_search_batch`; pgvector runs per-query loops.
+
+| Scenario | pgvector avg_ms | pg_faiss(batch) avg_ms | Speedup | pgvector Recall@10 | pg_faiss Recall@10 |
+|---|---:|---:|---:|---:|---:|
+| HNSW | 1.13 | 0.10 | 11.32x | 0.9552 | 1.0000 |
+| IVFFlat | 0.76 | 0.07 | 10.31x | 1.0000 | 1.0000 |
+
+Notes:
+- These are one-run CPU numbers collected on this machine and checked into README for traceability.
+- Parameters in this run: pgvector `hnsw.ef_search=512`, `ivfflat.probes=16`; pg_faiss `ef_search=128`, `nprobe=16`.
+- Reproduction SQL: `contrib/pg_faiss/test/bench/bench_cpu_batch_sample.sql`.
+
+### TAP Heavy Benchmarks (Acceptance)
+
+| Script | Focus | Default Heavy Scale |
+|---|---|---|
+| `test/t/020_perf_cpu_vs_pgvector.pl` | CPU vs pgvector (`hnsw`, `ivfflat`) | `1M x 768`, `100` queries |
+| `test/t/030_perf_gpu_vs_pgvector.pl` | GPU vs pgvector (`hnsw`) | `1M x 768`, `100` queries |
+
+## Install FAISS (CPU)
+
+```bash
+# Dependencies (macOS)
+brew install cmake libomp
+
+# Build/install FAISS 1.14.1 (CPU)
+git clone --branch v1.14.1 https://github.com/facebookresearch/faiss.git
+cd faiss
+cmake -B build \
+  -DFAISS_ENABLE_GPU=OFF \
+  -DBUILD_TESTING=OFF \
+  -DFAISS_ENABLE_PYTHON=OFF \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=$HOME/faiss-install \
+  -DOpenMP_CXX_FLAGS="-Xpreprocessor -fopenmp -I/usr/local/opt/libomp/include" \
+  -DOpenMP_CXX_LIB_NAMES=omp \
+  -DOpenMP_omp_LIBRARY=/usr/local/opt/libomp/lib/libomp.dylib
+cmake --build build -j
+cmake --install build
+```
+
+For Linux, remove the macOS OpenMP-specific flags and keep `FAISS_ENABLE_GPU=OFF`.
+
+## Quick Build
+
+```bash
+cd contrib/pg_faiss
+make
+make install
+```
+
+If FAISS is installed under `$HOME/faiss-install` (not a default system path), use:
+
+```bash
+cd contrib/pg_faiss
+make \
+  PG_CPPFLAGS="-I$HOME/faiss-install/include -I/usr/local/opt/libomp/include -std=c++17" \
+  SHLIB_LINK="-L$HOME/faiss-install/lib -lfaiss -L/usr/local/opt/libomp/lib -lomp -framework Accelerate -lc++ -lc++abi -bundle_loader $(pg_config --bindir)/postgres"
+make install
+```
+
+GPU build example:
+
+```bash
+cd contrib/pg_faiss
+make USE_FAISS_GPU=1 FAISS_GPU_LIBS="-lfaiss -lcudart -lcublas"
+make install
+```
+
+## Test & Benchmark
+
+```bash
+# Regression
+make installcheck
+
+# Recall TAP
+prove -I ./test/perl test/t/010_recall.pl
+
+# CPU perf TAP (heavy)
+PG_FAISS_RUN_PERF=1 \
+PG_FAISS_PERF_ROWS=1000000 \
+PG_FAISS_PERF_DIM=768 \
+PG_FAISS_PERF_QUERIES=100 \
+prove -I ./test/perl test/t/020_perf_cpu_vs_pgvector.pl
+
+# GPU perf TAP (heavy)
+PG_FAISS_RUN_PERF_GPU=1 \
+PG_FAISS_PERF_GPU_ROWS=1000000 \
+PG_FAISS_PERF_GPU_DIM=768 \
+PG_FAISS_PERF_GPU_QUERIES=100 \
+prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
+```
+
+## API
+
+- `pg_faiss_index_create(name, dim, metric, index_type, options, device)`
+- `pg_faiss_index_train(name, training_vectors)`
+- `pg_faiss_index_add(name, ids, vectors)`
+- `pg_faiss_index_search(name, query, k, search_params)`
+- `pg_faiss_index_search_batch(name, queries, k, search_params)`
+- `pg_faiss_index_save(name, path)` / `pg_faiss_index_load(name, path, device)`
+- `pg_faiss_index_stats(name)`
+- `pg_faiss_index_drop(name)` / `pg_faiss_reset()`
+
+## Docs
+
+- Design: [docs/design.md](docs/design.md)
+- Usage: [docs/usage.md](docs/usage.md)

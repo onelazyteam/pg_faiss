@@ -1,0 +1,39 @@
+EXTENSION = pg_faiss
+EXTVERSION = 0.2.0
+
+MODULE_big = pg_faiss
+
+OBJS = src/pg_faiss.o
+HEADERS = src/pg_faiss.h
+
+DATA = $(wildcard sql/*--*.sql)
+
+TESTS = $(wildcard test/sql/*.sql)
+REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
+REGRESS_OPTS = --inputdir=test
+TAP_TESTS = 1
+
+PG_CPPFLAGS += -I$(shell pg_config --includedir-server) -std=c++17
+SHLIB_LINK += -lfaiss
+
+USE_FAISS_GPU ?= 0
+ifeq ($(USE_FAISS_GPU),1)
+	PG_CPPFLAGS += -DUSE_FAISS_GPU
+	SHLIB_LINK += $(FAISS_GPU_LIBS)
+endif
+
+PG_CONFIG ?= pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+
+# for Mac
+ifeq ($(PROVE),)
+	PROVE = prove
+endif
+
+# for Postgres < 15
+PROVE_FLAGS += -I ./test/perl
+
+prove_installcheck:
+	rm -rf $(CURDIR)/tmp_check
+	cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" PGPORT='6$(DEF_PGPORT)' PG_REGRESS='$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),test/t/*.pl)
