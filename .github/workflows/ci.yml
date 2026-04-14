@@ -28,8 +28,8 @@ jobs:
             git \
             libfaiss-dev \
             libpq-dev \
-            postgresql \
-            postgresql-server-dev-all
+            postgresql-18 \
+            postgresql-server-dev-18
 
       - name: Show toolchain versions
         run: |
