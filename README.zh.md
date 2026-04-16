@@ -10,6 +10,10 @@ English version: [README.md](README.md)
 - 索引类型：`hnsw`、`ivfflat`、`ivfpq`
 - 距离度量：`l2`、`ip`、`cosine`
 - 支持 CPU 路径 + 可选 GPU 路径（`USE_FAISS_GPU=1`）
+- P0 可观测性：内置 runtime 计数与耗时统计
+- P1 混合检索：`ANN + ID allow-list`（单查/批查）
+- P1 自动调参：`latency/balanced/recall` 模式
+- P1 批量查询优化：分块执行（`batch_size`）+ 候选深度（`candidate_k`）
 - 版本化扩展脚本（`pg_faiss--0.2.0.sql`）
 - 回归测试 + TAP（正确性、召回、性能）
 
@@ -134,6 +138,10 @@ prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
 - `pg_faiss_index_add(name, ids, vectors)`
 - `pg_faiss_index_search(name, query, k, search_params)`
 - `pg_faiss_index_search_batch(name, queries, k, search_params)`
+- `pg_faiss_index_search_filtered(name, query, k, filter_ids, search_params)`
+- `pg_faiss_index_search_batch_filtered(name, queries, k, filter_ids, search_params)`
+- `pg_faiss_index_autotune(name, mode, options)`
+- `pg_faiss_metrics_reset(name default null)`
 - `pg_faiss_index_save(name, path)` / `pg_faiss_index_load(name, path, device)`
 - `pg_faiss_index_stats(name)`
 - `pg_faiss_index_drop(name)` / `pg_faiss_reset()`

@@ -1,8 +1,8 @@
 # pg_faiss v0.2 使用文档
 
-## 1. 前置依赖与 FAISS 安装
+## 1. 前置依赖与安装
 
-### 1.1 PostgreSQL 与 pgvector
+### 1.1 安装 pgvector
 
 ```bash
 cd contrib/pgvector
@@ -10,10 +10,9 @@ make
 make install
 ```
 
-### 1.2 FAISS CPU 安装（v1.14.1）
+### 1.2 安装 FAISS CPU（v1.14.1）
 
 ```bash
-# macOS 依赖
 brew install cmake libomp
 
 git clone --branch v1.14.1 https://github.com/facebookresearch/faiss.git
@@ -56,26 +55,17 @@ CREATE EXTENSION vector;
 CREATE EXTENSION pg_faiss;
 ```
 
-## 3. API 示例
+## 3. 快速开始
 
-完整 API 参数说明请见：[api.zh.md](api.zh.md)。
-
-### 3.1 创建索引
+### 3.1 创建与写入
 
 ```sql
 SELECT pg_faiss_index_create(
-  'docs_hnsw',
-  768,
-  'cosine',
-  'hnsw',
+  'docs_hnsw', 768, 'cosine', 'hnsw',
   '{"m":32,"ef_construction":200,"ef_search":64}'::jsonb,
   'cpu'
 );
-```
 
-### 3.2 批量写入向量
-
-```sql
 SELECT pg_faiss_index_add(
   'docs_hnsw',
   ARRAY[1,2,3]::bigint[],
@@ -87,7 +77,7 @@ SELECT pg_faiss_index_add(
 );
 ```
 
-### 3.3 单查询检索
+### 3.2 单查询
 
 ```sql
 SELECT *
@@ -99,7 +89,7 @@ FROM pg_faiss_index_search(
 );
 ```
 
-### 3.4 批查询检索
+### 3.3 批查询（优化路径）
 
 ```sql
 SELECT *
@@ -107,30 +97,63 @@ FROM pg_faiss_index_search_batch(
   'docs_hnsw',
   ARRAY['[0.1,0.2,0.3]'::vector, '[0.0,0.5,0.5]'::vector]::vector[],
   5,
-  '{}'::jsonb
+  '{"batch_size":256}'::jsonb
 );
 ```
 
-### 3.5 IVF 训练与检索
+## 4. 新能力使用示例
+
+### 4.1 可观测性
 
 ```sql
-SELECT pg_faiss_index_create(
-  'docs_ivf',
-  768,
-  'l2',
-  'ivfflat',
-  '{"nlist":4096,"nprobe":32}'::jsonb,
-  'cpu'
-);
-
-SELECT pg_faiss_index_train('docs_ivf', $training_vectors::vector[]);
-SELECT pg_faiss_index_add('docs_ivf', $ids::bigint[], $vectors::vector[]);
-
-SELECT *
-FROM pg_faiss_index_search('docs_ivf', $query::vector, 10, '{"nprobe":32}'::jsonb);
+SELECT pg_faiss_index_stats('docs_hnsw');
+SELECT pg_faiss_metrics_reset('docs_hnsw');
 ```
 
-### 3.6 保存与加载
+### 4.2 混合检索（ANN + 业务过滤）
+
+```sql
+WITH allow_list AS (
+  SELECT array_agg(id ORDER BY id) AS ids
+  FROM product_embedding
+  WHERE tenant_id = 42
+    AND category = 'electronics'
+    AND is_active = true
+)
+SELECT *
+FROM pg_faiss_index_search_filtered(
+  'docs_hnsw',
+  '[0.1,0.2,0.3]'::vector,
+  20,
+  (SELECT ids FROM allow_list),
+  '{"candidate_k":200,"ef_search":128}'::jsonb
+);
+```
+
+### 4.3 自动调参
+
+```sql
+SELECT pg_faiss_index_autotune(
+  'docs_hnsw',
+  'balanced',
+  '{"target_recall":0.97,"min_batch_size":64,"max_batch_size":2048}'::jsonb
+);
+```
+
+### 4.4 批量混合检索
+
+```sql
+SELECT *
+FROM pg_faiss_index_search_batch_filtered(
+  'docs_hnsw',
+  ARRAY['[0.1,0.2,0.3]'::vector, '[0.0,0.5,0.5]'::vector]::vector[],
+  10,
+  ARRAY[1,2,3,4,5]::bigint[],
+  '{"candidate_k":100,"batch_size":128}'::jsonb
+);
+```
+
+## 5. 持久化
 
 ```sql
 SELECT pg_faiss_index_save('docs_hnsw', '/tmp/docs_hnsw.faiss');
@@ -138,27 +161,14 @@ SELECT pg_faiss_index_drop('docs_hnsw');
 SELECT pg_faiss_index_load('docs_hnsw', '/tmp/docs_hnsw.faiss', 'cpu');
 ```
 
-### 3.7 统计信息
-
-```sql
-SELECT pg_faiss_index_stats('docs_hnsw');
-```
-
-## 4. 性能与召回测试
-
-### 4.1 pg_regress
+## 6. 测试
 
 ```bash
 make installcheck
-```
-
-### 4.2 Recall TAP
-
-```bash
 prove -I ./test/perl test/t/010_recall.pl
 ```
 
-### 4.3 CPU 性能 TAP（重负载）
+重性能测试：
 
 ```bash
 PG_FAISS_RUN_PERF=1 \
@@ -168,25 +178,8 @@ PG_FAISS_PERF_QUERIES=100 \
 prove -I ./test/perl test/t/020_perf_cpu_vs_pgvector.pl
 ```
 
-### 4.4 README 轻量复现实测脚本
+## 7. 推荐阅读
 
-```bash
-psql -d <your_db> -f contrib/pg_faiss/test/bench/bench_cpu_batch_sample.sql
-```
-
-### 4.5 GPU 性能 TAP（重负载）
-
-```bash
-PG_FAISS_RUN_PERF_GPU=1 \
-PG_FAISS_PERF_GPU_ROWS=1000000 \
-PG_FAISS_PERF_GPU_DIM=768 \
-PG_FAISS_PERF_GPU_QUERIES=100 \
-prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
-```
-
-## 5. 说明
-
-- 对比基线版本：pgvector `0.8.2`，FAISS `1.14.1`。
-- 重性能基准建议在主分支/夜间流水线执行，不建议每个 PR 默认执行。
-- GPU 测试在 GPU 路径不可用时会自动跳过。
-- `pg_faiss` 索引注册表为 backend 本地状态；跨会话需要重新创建或加载索引。
+- API 细节：`docs/api.zh.md`
+- 设计文档：`docs/design.zh.md`
+- 英文文档：`README.md` / `docs/api.md` / `docs/design.md`

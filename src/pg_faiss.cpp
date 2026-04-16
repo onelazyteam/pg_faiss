@@ -6,6 +6,7 @@ extern "C" {
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -22,9 +23,11 @@ extern "C" {
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <faiss/IndexFlat.h>
@@ -49,8 +52,12 @@ PG_FUNCTION_INFO_V1(pg_faiss_index_train);
 PG_FUNCTION_INFO_V1(pg_faiss_index_add);
 PG_FUNCTION_INFO_V1(pg_faiss_index_search);
 PG_FUNCTION_INFO_V1(pg_faiss_index_search_batch);
+PG_FUNCTION_INFO_V1(pg_faiss_index_search_filtered);
+PG_FUNCTION_INFO_V1(pg_faiss_index_search_batch_filtered);
 PG_FUNCTION_INFO_V1(pg_faiss_index_save);
 PG_FUNCTION_INFO_V1(pg_faiss_index_load);
+PG_FUNCTION_INFO_V1(pg_faiss_index_autotune);
+PG_FUNCTION_INFO_V1(pg_faiss_metrics_reset);
 PG_FUNCTION_INFO_V1(pg_faiss_index_stats);
 PG_FUNCTION_INFO_V1(pg_faiss_index_drop);
 PG_FUNCTION_INFO_V1(pg_faiss_reset);
@@ -111,6 +118,58 @@ static inline const char* index_type_name(int index_type) {
 
 static inline const char* device_name(int device) {
   return device == PG_FAISS_DEVICE_GPU ? "gpu" : "cpu";
+}
+
+static inline const char* autotune_mode_name(int mode) {
+  switch (mode) {
+    case PG_FAISS_AUTOTUNE_LATENCY:
+      return "latency";
+    case PG_FAISS_AUTOTUNE_RECALL:
+      return "recall";
+    case PG_FAISS_AUTOTUNE_BALANCED:
+    default:
+      return "balanced";
+  }
+}
+
+static inline void reset_runtime_stats(PgFaissIndexEntry* entry, bool reset_tuning) {
+  entry->train_calls = 0;
+  entry->add_calls = 0;
+  entry->add_vectors_total = 0;
+  entry->search_single_calls = 0;
+  entry->search_batch_calls = 0;
+  entry->search_filtered_calls = 0;
+  entry->search_query_total = 0;
+  entry->search_result_total = 0;
+  entry->save_calls = 0;
+  entry->load_calls = 0;
+  entry->autotune_calls = 0;
+  entry->error_calls = 0;
+  entry->search_single_ms_total = 0.0;
+  entry->search_batch_ms_total = 0.0;
+  entry->search_filtered_ms_total = 0.0;
+  if (reset_tuning) {
+    entry->last_candidate_k = 0;
+    entry->last_batch_size = 0;
+    entry->last_autotune_mode = PG_FAISS_AUTOTUNE_BALANCED;
+    entry->preferred_batch_size = 256;
+  }
+}
+
+static inline double elapsed_ms(const instr_time& start_time, const instr_time& end_time) {
+  instr_time delta = end_time;
+
+  INSTR_TIME_SUBTRACT(delta, start_time);
+  return INSTR_TIME_GET_MILLISEC(delta);
+}
+
+static inline void record_error(PgFaissIndexEntry* entry) {
+  if (entry != NULL) entry->error_calls++;
+}
+
+static inline void initialize_entry_defaults(PgFaissIndexEntry* entry) {
+  reset_runtime_stats(entry, true);
+  if (entry->device == PG_FAISS_DEVICE_GPU) entry->preferred_batch_size = 1024;
 }
 
 static inline faiss::MetricType to_faiss_metric(int metric) {
@@ -252,6 +311,34 @@ static bool jsonb_get_int32(Jsonb* json, const char* key, int32* out) {
   return false;
 }
 
+static bool jsonb_get_float8(Jsonb* json, const char* key, double* out) {
+  JsonbValue* value = jsonb_find_key(json, key);
+
+  if (value == NULL) return false;
+
+  if (value->type == jbvNumeric) {
+    *out = DatumGetFloat8(DirectFunctionCall1(numeric_float8, NumericGetDatum(value->val.numeric)));
+    return true;
+  }
+
+  if (value->type == jbvString) {
+    std::string text(value->val.string.val, value->val.string.len);
+
+    try {
+      *out = std::stod(text);
+      return true;
+    } catch (const std::exception&) {
+      ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                      errmsg("invalid float value for option \"%s\"", key)));
+    }
+  }
+
+  ereport(ERROR,
+          (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("option \"%s\" must be a float", key)));
+
+  return false;
+}
+
 static int32 jsonb_option_int32(Jsonb* json, const char* key, int32 default_value, int32 min_value,
                                 int32 max_value) {
   int32 value = default_value;
@@ -264,6 +351,16 @@ static int32 jsonb_option_int32(Jsonb* json, const char* key, int32 default_valu
              errmsg("option \"%s\" out of range (%d..%d): %d", key, min_value, max_value, value)));
 
   return value;
+}
+
+static int parse_autotune_mode(const char* mode) {
+  if (pg_strcasecmp(mode, "balanced") == 0) return PG_FAISS_AUTOTUNE_BALANCED;
+  if (pg_strcasecmp(mode, "latency") == 0) return PG_FAISS_AUTOTUNE_LATENCY;
+  if (pg_strcasecmp(mode, "recall") == 0) return PG_FAISS_AUTOTUNE_RECALL;
+
+  ereport(ERROR,
+          (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("unknown autotune mode: %s", mode)));
+  return PG_FAISS_AUTOTUNE_BALANCED;
 }
 
 static inline PgVector* datum_to_pgvector(Datum datum) {
@@ -343,13 +440,54 @@ static void read_ids_array(ArrayType* arr, std::vector<faiss::idx_t>& ids) {
   pfree(nulls);
 }
 
-static void apply_search_params(PgFaissIndexEntry* entry, faiss::Index* index, Jsonb* search_params,
-                                int* old_ef_search, int* old_nprobe, bool* changed_ef_search,
-                                bool* changed_nprobe) {
-  faiss::Index* base = unwrap_idmap(index);
+static void read_optional_ids_array(ArrayType* arr, std::unordered_set<faiss::idx_t>* out,
+                                    bool* has_filter) {
+  std::vector<faiss::idx_t> ids;
 
-  *changed_ef_search = false;
-  *changed_nprobe = false;
+  if (arr == NULL) {
+    *has_filter = false;
+    return;
+  }
+
+  read_ids_array(arr, ids);
+  out->reserve(ids.size());
+  for (size_t i = 0; i < ids.size(); ++i) out->insert(ids[i]);
+
+  *has_filter = true;
+}
+
+typedef struct SearchExecutionOptions {
+  int32 candidate_k;
+  int32 batch_size;
+  int old_ef_search;
+  int old_nprobe;
+  bool changed_ef_search;
+  bool changed_nprobe;
+} SearchExecutionOptions;
+
+static void apply_search_params(PgFaissIndexEntry* entry, faiss::Index* index, Jsonb* search_params,
+                                int32 effective_k, bool widen_candidate,
+                                SearchExecutionOptions* options) {
+  faiss::Index* base = unwrap_idmap(index);
+  int32 candidate_k_default = effective_k;
+
+  if (widen_candidate) {
+    candidate_k_default =
+        std::min<int64>(std::max<int64>((int64)effective_k * 8, effective_k), index->ntotal);
+  }
+
+  options->changed_ef_search = false;
+  options->changed_nprobe = false;
+  options->old_ef_search = 0;
+  options->old_nprobe = 0;
+  options->candidate_k =
+      jsonb_option_int32(search_params, "candidate_k", candidate_k_default, effective_k, 1000000);
+  options->batch_size =
+      jsonb_option_int32(search_params, "batch_size", entry->preferred_batch_size, 1, 1000000);
+
+  if (options->candidate_k < effective_k) options->candidate_k = effective_k;
+  options->candidate_k = std::min<int64>(options->candidate_k, index->ntotal);
+  if (options->batch_size <= 0) options->batch_size = entry->preferred_batch_size;
 
   if (entry->index_type == PG_FAISS_INDEX_HNSW) {
     faiss::IndexHNSW* hnsw = dynamic_cast<faiss::IndexHNSW*>(base);
@@ -363,9 +501,9 @@ static void apply_search_params(PgFaissIndexEntry* entry, faiss::Index* index, J
                           errmsg("ef_search must be in range 1..1000000")));
       }
 
-      *old_ef_search = hnsw->hnsw.efSearch;
+      options->old_ef_search = hnsw->hnsw.efSearch;
       hnsw->hnsw.efSearch = ef_search;
-      *changed_ef_search = true;
+      options->changed_ef_search = true;
     }
   }
 
@@ -381,28 +519,48 @@ static void apply_search_params(PgFaissIndexEntry* entry, faiss::Index* index, J
                           errmsg("nprobe must be in range 1..1000000")));
       }
 
-      *old_nprobe = ivf->nprobe;
+      options->old_nprobe = ivf->nprobe;
       ivf->nprobe = nprobe;
-      *changed_nprobe = true;
+      options->changed_nprobe = true;
     }
   }
 }
 
-static void restore_search_params(faiss::Index* index, int old_ef_search, int old_nprobe,
-                                  bool changed_ef_search, bool changed_nprobe) {
+static void restore_search_params(faiss::Index* index, const SearchExecutionOptions* options) {
   faiss::Index* base = unwrap_idmap(index);
 
-  if (changed_ef_search) {
+  if (options->changed_ef_search) {
     faiss::IndexHNSW* hnsw = dynamic_cast<faiss::IndexHNSW*>(base);
 
-    if (hnsw != NULL) hnsw->hnsw.efSearch = old_ef_search;
+    if (hnsw != NULL) hnsw->hnsw.efSearch = options->old_ef_search;
   }
 
-  if (changed_nprobe) {
+  if (options->changed_nprobe) {
     faiss::IndexIVF* ivf = dynamic_cast<faiss::IndexIVF*>(base);
 
-    if (ivf != NULL) ivf->nprobe = old_nprobe;
+    if (ivf != NULL) ivf->nprobe = options->old_nprobe;
   }
+}
+
+static void append_search_row(Tuplestorestate* tupstore, TupleDesc tupdesc, int query_no,
+                              bool include_query_no, int64 id, float distance) {
+  if (include_query_no) {
+    Datum values[3];
+    bool nulls[3] = {false, false, false};
+
+    values[0] = Int32GetDatum(query_no);
+    values[1] = Int64GetDatum(id);
+    values[2] = Float4GetDatum(distance);
+    tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    return;
+  }
+
+  Datum values[2];
+  bool nulls[2] = {false, false};
+
+  values[0] = Int64GetDatum(id);
+  values[1] = Float4GetDatum(distance);
+  tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 }
 
 static void materialize_result_begin(FunctionCallInfo fcinfo, Tuplestorestate** tupstore,
@@ -591,6 +749,7 @@ extern "C" Datum pg_faiss_index_create(PG_FUNCTION_ARGS) {
   entry->ivfpq_m = jsonb_option_int32(options, "pq_m", PG_FAISS_DEFAULT_IVFPQ_M, 1, 4096);
   entry->ivfpq_bits = jsonb_option_int32(options, "pq_bits", PG_FAISS_DEFAULT_IVFPQ_BITS, 1, 16);
   entry->gpu_device = jsonb_option_int32(options, "gpu_device", 0, 0, 128);
+  initialize_entry_defaults(entry);
 
   try {
     entry->cpu_index = build_index(entry);
@@ -602,6 +761,7 @@ extern "C" Datum pg_faiss_index_create(PG_FUNCTION_ARGS) {
 #endif
   } catch (const std::exception& e) {
     hash_search(pg_faiss_registry, name, HASH_REMOVE, NULL);
+    record_error(entry);
     ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                     errmsg("FAISS create error: %s", e.what())));
   }
@@ -630,6 +790,7 @@ extern "C" Datum pg_faiss_index_train(PG_FUNCTION_ARGS) {
   if (entry->metric == PG_FAISS_METRIC_COSINE) normalize_many(vectors.data(), n, entry->dim);
 
   try {
+    entry->train_calls++;
     faiss::Index* index = active_index(entry);
     index->train(n, vectors.data());
     entry->is_trained = index->is_trained;
@@ -638,6 +799,7 @@ extern "C" Datum pg_faiss_index_train(PG_FUNCTION_ARGS) {
     if (entry->device == PG_FAISS_DEVICE_GPU) sync_gpu_to_cpu(entry);
 #endif
   } catch (const std::exception& e) {
+    record_error(entry);
     ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                     errmsg("FAISS train error: %s", e.what())));
   }
@@ -670,6 +832,7 @@ extern "C" Datum pg_faiss_index_add(PG_FUNCTION_ARGS) {
   if (entry->metric == PG_FAISS_METRIC_COSINE) normalize_many(vectors.data(), n, entry->dim);
 
   try {
+    entry->add_calls++;
     faiss::Index* index = active_index(entry);
     faiss::IndexIDMap2* idmap = dynamic_cast<faiss::IndexIDMap2*>(index);
 
@@ -683,10 +846,12 @@ extern "C" Datum pg_faiss_index_add(PG_FUNCTION_ARGS) {
 
     idmap->add_with_ids(n, vectors.data(), ids.data());
     entry->num_vectors = index->ntotal;
+    entry->add_vectors_total += n;
 #ifdef USE_FAISS_GPU
     if (entry->device == PG_FAISS_DEVICE_GPU) sync_gpu_to_cpu(entry);
 #endif
   } catch (const std::exception& e) {
+    record_error(entry);
     ereport(ERROR,
             (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION), errmsg("FAISS add error: %s", e.what())));
   }
@@ -704,6 +869,9 @@ extern "C" Datum pg_faiss_index_search(PG_FUNCTION_ARGS) {
   ReturnSetInfo* rsinfo;
   Tuplestorestate* tupstore;
   TupleDesc tupdesc;
+  int64 emitted_rows = 0;
+  instr_time started_at;
+  instr_time finished_at;
 
   if (entry == NULL)
     ereport(ERROR,
@@ -717,6 +885,7 @@ extern "C" Datum pg_faiss_index_search(PG_FUNCTION_ARGS) {
   if (k <= 0) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("k must be > 0")));
 
   materialize_result_begin(fcinfo, &tupstore, &tupdesc, &rsinfo);
+  INSTR_TIME_SET_CURRENT(started_at);
 
   try {
     faiss::Index* index = active_index(entry);
@@ -724,48 +893,131 @@ extern "C" Datum pg_faiss_index_search(PG_FUNCTION_ARGS) {
 
     if (effective_k > 0) {
       std::vector<float> query_buf(entry->dim);
-      std::vector<float> distances(effective_k);
-      std::vector<faiss::idx_t> labels(effective_k);
-      int old_ef_search = 0;
-      int old_nprobe = 0;
-      bool changed_ef_search = false;
-      bool changed_nprobe = false;
+      SearchExecutionOptions options;
+      std::vector<float> distances;
+      std::vector<faiss::idx_t> labels;
+      bool params_applied = false;
 
       memcpy(query_buf.data(), query->x, sizeof(float) * entry->dim);
-
       if (entry->metric == PG_FAISS_METRIC_COSINE) normalize_one(query_buf.data(), entry->dim);
 
-      apply_search_params(entry, index, search_params, &old_ef_search, &old_nprobe,
-                          &changed_ef_search, &changed_nprobe);
+      apply_search_params(entry, index, search_params, effective_k, false, &options);
+      params_applied = true;
+      distances.resize(options.candidate_k);
+      labels.resize(options.candidate_k);
 
-      index->search(1, query_buf.data(), effective_k, distances.data(), labels.data());
+      try {
+        index->search(1, query_buf.data(), options.candidate_k, distances.data(), labels.data());
+      } catch (...) {
+        if (params_applied) restore_search_params(index, &options);
+        throw;
+      }
+      restore_search_params(index, &options);
 
-      restore_search_params(index, old_ef_search, old_nprobe, changed_ef_search, changed_nprobe);
-
-      for (int i = 0; i < effective_k; i++) {
-        Datum values[2];
-        bool nulls[2] = {false, false};
-        float distance = distances[i];
+      for (int i = 0; i < options.candidate_k && emitted_rows < effective_k; ++i) {
+        float distance;
 
         if (labels[i] < 0) continue;
-
+        distance = distances[i];
         if (entry->metric == PG_FAISS_METRIC_COSINE) distance = 1.0f - distance;
-
-        values[0] = Int64GetDatum((int64)labels[i]);
-        values[1] = Float4GetDatum(distance);
-
-        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+        append_search_row(tupstore, tupdesc, 0, false, (int64)labels[i], distance);
+        emitted_rows++;
       }
+
+      entry->last_candidate_k = options.candidate_k;
+      entry->last_batch_size = 1;
     }
   } catch (const std::exception& e) {
+    record_error(entry);
     ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                     errmsg("FAISS search error: %s", e.what())));
   }
 
+  INSTR_TIME_SET_CURRENT(finished_at);
+  entry->search_single_calls++;
+  entry->search_query_total++;
+  entry->search_result_total += emitted_rows;
+  entry->search_single_ms_total += elapsed_ms(started_at, finished_at);
   materialize_result_end(rsinfo, tupstore, tupdesc);
 
   pfree(name);
   PG_RETURN_NULL();
+}
+
+static int64 emit_batch_results(Tuplestorestate* tupstore, TupleDesc tupdesc, int32 global_q_start,
+                                int32 effective_k, int32 candidate_k, int64 chunk_queries,
+                                const std::vector<float>& distances,
+                                const std::vector<faiss::idx_t>& labels, bool cosine_metric,
+                                bool filtered, const std::unordered_set<faiss::idx_t>* filter_ids) {
+  int64 emitted_rows = 0;
+
+  for (int64 q = 0; q < chunk_queries; ++q) {
+    int32 emitted_for_query = 0;
+
+    for (int32 i = 0; i < candidate_k; ++i) {
+      size_t offset = (size_t)q * (size_t)candidate_k + (size_t)i;
+      faiss::idx_t id = labels[offset];
+      float distance = distances[offset];
+
+      if (id < 0) continue;
+      if (filtered && filter_ids->find(id) == filter_ids->end()) continue;
+
+      if (cosine_metric) distance = 1.0f - distance;
+      append_search_row(tupstore, tupdesc, global_q_start + (int32)q + 1, true, (int64)id,
+                        distance);
+
+      emitted_rows++;
+      emitted_for_query++;
+      if (emitted_for_query >= effective_k) break;
+    }
+  }
+
+  return emitted_rows;
+}
+
+static void run_batch_search(PgFaissIndexEntry* entry, ArrayType* queries_arr, int32 k,
+                             Jsonb* search_params, bool filtered,
+                             const std::unordered_set<faiss::idx_t>* filter_ids,
+                             Tuplestorestate* tupstore, TupleDesc tupdesc, int64* emitted_rows) {
+  std::vector<float> queries;
+  int64 num_queries = 0;
+  faiss::Index* index = active_index(entry);
+  int32 effective_k = std::min<int64>(k, index->ntotal);
+
+  *emitted_rows = 0;
+  read_vector_array(queries_arr, entry->dim, queries, &num_queries);
+  if (entry->metric == PG_FAISS_METRIC_COSINE)
+    normalize_many(queries.data(), num_queries, entry->dim);
+  if (effective_k <= 0) return;
+
+  SearchExecutionOptions options;
+  int64 offset = 0;
+  bool params_applied = false;
+  apply_search_params(entry, index, search_params, effective_k, filtered, &options);
+  params_applied = true;
+  entry->last_candidate_k = options.candidate_k;
+
+  try {
+    while (offset < num_queries) {
+      int64 chunk_queries = std::min<int64>(options.batch_size, num_queries - offset);
+      std::vector<float> distances((size_t)chunk_queries * (size_t)options.candidate_k);
+      std::vector<faiss::idx_t> labels((size_t)chunk_queries * (size_t)options.candidate_k);
+      const float* chunk_query_data = queries.data() + (size_t)offset * (size_t)entry->dim;
+
+      index->search(chunk_queries, chunk_query_data, options.candidate_k, distances.data(),
+                    labels.data());
+      *emitted_rows += emit_batch_results(
+          tupstore, tupdesc, (int32)offset, effective_k, options.candidate_k, chunk_queries,
+          distances, labels, entry->metric == PG_FAISS_METRIC_COSINE, filtered, filter_ids);
+      offset += chunk_queries;
+    }
+  } catch (...) {
+    if (params_applied) restore_search_params(index, &options);
+    throw;
+  }
+
+  restore_search_params(index, &options);
+  entry->last_batch_size = options.batch_size;
 }
 
 extern "C" Datum pg_faiss_index_search_batch(PG_FUNCTION_ARGS) {
@@ -777,67 +1029,174 @@ extern "C" Datum pg_faiss_index_search_batch(PG_FUNCTION_ARGS) {
   ReturnSetInfo* rsinfo;
   Tuplestorestate* tupstore;
   TupleDesc tupdesc;
+  int64 emitted_rows = 0;
+  int64 query_count = ArrayGetNItems(ARR_NDIM(queries_arr), ARR_DIMS(queries_arr));
+  instr_time started_at;
+  instr_time finished_at;
 
   if (entry == NULL)
     ereport(ERROR,
             (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("index \"%s\" does not exist", name)));
-
   if (k <= 0) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("k must be > 0")));
 
   materialize_result_begin(fcinfo, &tupstore, &tupdesc, &rsinfo);
+  INSTR_TIME_SET_CURRENT(started_at);
 
   try {
-    std::vector<float> queries;
-    int64 num_queries = 0;
-    faiss::Index* index = active_index(entry);
-    int32 effective_k;
-
-    read_vector_array(queries_arr, entry->dim, queries, &num_queries);
-
-    if (entry->metric == PG_FAISS_METRIC_COSINE)
-      normalize_many(queries.data(), num_queries, entry->dim);
-
-    effective_k = std::min<int64>(k, index->ntotal);
-
-    if (effective_k > 0) {
-      std::vector<float> distances((size_t)num_queries * (size_t)effective_k);
-      std::vector<faiss::idx_t> labels((size_t)num_queries * (size_t)effective_k);
-      int old_ef_search = 0;
-      int old_nprobe = 0;
-      bool changed_ef_search = false;
-      bool changed_nprobe = false;
-
-      apply_search_params(entry, index, search_params, &old_ef_search, &old_nprobe,
-                          &changed_ef_search, &changed_nprobe);
-
-      index->search(num_queries, queries.data(), effective_k, distances.data(), labels.data());
-
-      restore_search_params(index, old_ef_search, old_nprobe, changed_ef_search, changed_nprobe);
-
-      for (int64 q = 0; q < num_queries; q++) {
-        for (int i = 0; i < effective_k; i++) {
-          size_t off = (size_t)q * (size_t)effective_k + (size_t)i;
-          Datum values[3];
-          bool nulls[3] = {false, false, false};
-          float distance = distances[off];
-
-          if (labels[off] < 0) continue;
-
-          if (entry->metric == PG_FAISS_METRIC_COSINE) distance = 1.0f - distance;
-
-          values[0] = Int32GetDatum((int32)(q + 1));
-          values[1] = Int64GetDatum((int64)labels[off]);
-          values[2] = Float4GetDatum(distance);
-
-          tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-        }
-      }
-    }
+    run_batch_search(entry, queries_arr, k, search_params, false, NULL, tupstore, tupdesc,
+                     &emitted_rows);
   } catch (const std::exception& e) {
+    record_error(entry);
     ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                     errmsg("FAISS batch search error: %s", e.what())));
   }
 
+  INSTR_TIME_SET_CURRENT(finished_at);
+  entry->search_batch_calls++;
+  entry->search_query_total += query_count;
+  entry->search_result_total += emitted_rows;
+  entry->search_batch_ms_total += elapsed_ms(started_at, finished_at);
+  materialize_result_end(rsinfo, tupstore, tupdesc);
+
+  pfree(name);
+  PG_RETURN_NULL();
+}
+
+extern "C" Datum pg_faiss_index_search_filtered(PG_FUNCTION_ARGS) {
+  char* name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  PgVector* query = datum_to_pgvector(PG_GETARG_DATUM(1));
+  int32 k = PG_GETARG_INT32(2);
+  ArrayType* filter_ids_arr = PG_GETARG_ARRAYTYPE_P(3);
+  Jsonb* search_params = PG_GETARG_JSONB_P(4);
+  PgFaissIndexEntry* entry = lookup_entry(name);
+  ReturnSetInfo* rsinfo;
+  Tuplestorestate* tupstore;
+  TupleDesc tupdesc;
+  std::unordered_set<faiss::idx_t> filter_ids;
+  bool has_filter = false;
+  int64 emitted_rows = 0;
+  instr_time started_at;
+  instr_time finished_at;
+
+  if (entry == NULL)
+    ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("index \"%s\" does not exist", name)));
+  if (query->dim != entry->dim)
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+             errmsg("query dimension mismatch: expected %d, got %d", entry->dim, query->dim)));
+  if (k <= 0) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("k must be > 0")));
+
+  read_optional_ids_array(filter_ids_arr, &filter_ids, &has_filter);
+  if (!has_filter)
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("filter_ids must not be NULL")));
+
+  materialize_result_begin(fcinfo, &tupstore, &tupdesc, &rsinfo);
+  INSTR_TIME_SET_CURRENT(started_at);
+
+  try {
+    faiss::Index* index = active_index(entry);
+    int32 effective_k = std::min<int64>(k, index->ntotal);
+
+    if (effective_k > 0) {
+      std::vector<float> query_buf(entry->dim);
+      SearchExecutionOptions options;
+      std::vector<float> distances;
+      std::vector<faiss::idx_t> labels;
+      bool params_applied = false;
+
+      memcpy(query_buf.data(), query->x, sizeof(float) * entry->dim);
+      if (entry->metric == PG_FAISS_METRIC_COSINE) normalize_one(query_buf.data(), entry->dim);
+
+      apply_search_params(entry, index, search_params, effective_k, true, &options);
+      params_applied = true;
+      distances.resize(options.candidate_k);
+      labels.resize(options.candidate_k);
+      try {
+        index->search(1, query_buf.data(), options.candidate_k, distances.data(), labels.data());
+      } catch (...) {
+        if (params_applied) restore_search_params(index, &options);
+        throw;
+      }
+      restore_search_params(index, &options);
+
+      for (int32 i = 0; i < options.candidate_k && emitted_rows < effective_k; ++i) {
+        float distance;
+        faiss::idx_t id = labels[i];
+
+        if (id < 0) continue;
+        if (filter_ids.find(id) == filter_ids.end()) continue;
+        distance = distances[i];
+        if (entry->metric == PG_FAISS_METRIC_COSINE) distance = 1.0f - distance;
+        append_search_row(tupstore, tupdesc, 0, false, (int64)id, distance);
+        emitted_rows++;
+      }
+
+      entry->last_candidate_k = options.candidate_k;
+      entry->last_batch_size = 1;
+    }
+  } catch (const std::exception& e) {
+    record_error(entry);
+    ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                    errmsg("FAISS filtered search error: %s", e.what())));
+  }
+
+  INSTR_TIME_SET_CURRENT(finished_at);
+  entry->search_filtered_calls++;
+  entry->search_query_total++;
+  entry->search_result_total += emitted_rows;
+  entry->search_filtered_ms_total += elapsed_ms(started_at, finished_at);
+  materialize_result_end(rsinfo, tupstore, tupdesc);
+
+  pfree(name);
+  PG_RETURN_NULL();
+}
+
+extern "C" Datum pg_faiss_index_search_batch_filtered(PG_FUNCTION_ARGS) {
+  char* name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  ArrayType* queries_arr = PG_GETARG_ARRAYTYPE_P(1);
+  int32 k = PG_GETARG_INT32(2);
+  ArrayType* filter_ids_arr = PG_GETARG_ARRAYTYPE_P(3);
+  Jsonb* search_params = PG_GETARG_JSONB_P(4);
+  PgFaissIndexEntry* entry = lookup_entry(name);
+  ReturnSetInfo* rsinfo;
+  Tuplestorestate* tupstore;
+  TupleDesc tupdesc;
+  std::unordered_set<faiss::idx_t> filter_ids;
+  bool has_filter = false;
+  int64 emitted_rows = 0;
+  int64 query_count = ArrayGetNItems(ARR_NDIM(queries_arr), ARR_DIMS(queries_arr));
+  instr_time started_at;
+  instr_time finished_at;
+
+  if (entry == NULL)
+    ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("index \"%s\" does not exist", name)));
+  if (k <= 0) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("k must be > 0")));
+
+  read_optional_ids_array(filter_ids_arr, &filter_ids, &has_filter);
+  if (!has_filter)
+    ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("filter_ids must not be NULL")));
+
+  materialize_result_begin(fcinfo, &tupstore, &tupdesc, &rsinfo);
+  INSTR_TIME_SET_CURRENT(started_at);
+
+  try {
+    run_batch_search(entry, queries_arr, k, search_params, true, &filter_ids, tupstore, tupdesc,
+                     &emitted_rows);
+  } catch (const std::exception& e) {
+    record_error(entry);
+    ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                    errmsg("FAISS filtered batch search error: %s", e.what())));
+  }
+
+  INSTR_TIME_SET_CURRENT(finished_at);
+  entry->search_filtered_calls++;
+  entry->search_query_total += query_count;
+  entry->search_result_total += emitted_rows;
+  entry->search_filtered_ms_total += elapsed_ms(started_at, finished_at);
   materialize_result_end(rsinfo, tupstore, tupdesc);
 
   pfree(name);
@@ -854,6 +1213,7 @@ extern "C" Datum pg_faiss_index_save(PG_FUNCTION_ARGS) {
             (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("index \"%s\" does not exist", name)));
 
   try {
+    entry->save_calls++;
 #ifdef USE_FAISS_GPU
     if (entry->device == PG_FAISS_DEVICE_GPU) sync_gpu_to_cpu(entry);
 #endif
@@ -862,6 +1222,7 @@ extern "C" Datum pg_faiss_index_save(PG_FUNCTION_ARGS) {
     write_metadata_file(entry, path);
     strlcpy(entry->index_path, path, sizeof(entry->index_path));
   } catch (const std::exception& e) {
+    record_error(entry);
     ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                     errmsg("FAISS save error: %s", e.what())));
   }
@@ -898,6 +1259,7 @@ extern "C" Datum pg_faiss_index_load(PG_FUNCTION_ARGS) {
 
   memset(entry, 0, sizeof(PgFaissIndexEntry));
   strlcpy(entry->name, name, sizeof(entry->name));
+  initialize_entry_defaults(entry);
 
   try {
     loaded_index = faiss::read_index(path);
@@ -913,6 +1275,7 @@ extern "C" Datum pg_faiss_index_load(PG_FUNCTION_ARGS) {
         loaded_index->metric_type == faiss::METRIC_L2 ? PG_FAISS_METRIC_L2 : PG_FAISS_METRIC_IP;
     entry->index_type = PG_FAISS_INDEX_HNSW;
     entry->device = parsed_device;
+    if (entry->device == PG_FAISS_DEVICE_GPU) entry->preferred_batch_size = 1024;
     base_index = unwrap_idmap(loaded_index);
 
     if (dynamic_cast<faiss::IndexHNSW*>(base_index) != NULL)
@@ -960,6 +1323,7 @@ extern "C" Datum pg_faiss_index_load(PG_FUNCTION_ARGS) {
 
     entry->num_vectors = loaded_index->ntotal;
     entry->is_trained = loaded_index->is_trained;
+    entry->load_calls = 1;
     strlcpy(entry->index_path, path, sizeof(entry->index_path));
 
 #ifdef USE_FAISS_GPU
@@ -967,6 +1331,7 @@ extern "C" Datum pg_faiss_index_load(PG_FUNCTION_ARGS) {
 #endif
   } catch (const std::exception& e) {
     hash_search(pg_faiss_registry, name, HASH_REMOVE, NULL);
+    record_error(entry);
     ereport(ERROR, (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                     errmsg("FAISS load error: %s", e.what())));
   }
@@ -974,6 +1339,129 @@ extern "C" Datum pg_faiss_index_load(PG_FUNCTION_ARGS) {
   pfree(name);
   pfree(path);
   pfree(device);
+  PG_RETURN_VOID();
+}
+
+static int32 clamp_int32(int64 value, int32 min_value, int32 max_value) {
+  if (value < min_value) return min_value;
+  if (value > max_value) return max_value;
+  return (int32)value;
+}
+
+extern "C" Datum pg_faiss_index_autotune(PG_FUNCTION_ARGS) {
+  char* name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  char* mode_text = text_to_cstring(PG_GETARG_TEXT_PP(1));
+  Jsonb* options = PG_GETARG_JSONB_P(2);
+  PgFaissIndexEntry* entry = lookup_entry(name);
+  int mode = parse_autotune_mode(mode_text);
+  double target_recall = 0.95;
+  int32 min_batch_size = 32;
+  int32 max_batch_size = 4096;
+  int32 old_hnsw_ef_search = 0;
+  int32 old_ivf_nprobe = 0;
+  int32 old_batch_size = 0;
+  StringInfoData json;
+  Datum result;
+
+  if (entry == NULL)
+    ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("index \"%s\" does not exist", name)));
+
+  old_hnsw_ef_search = entry->hnsw_ef_search;
+  old_ivf_nprobe = entry->ivf_nprobe;
+  old_batch_size = entry->preferred_batch_size;
+  jsonb_get_float8(options, "target_recall", &target_recall);
+  min_batch_size = jsonb_option_int32(options, "min_batch_size", 32, 1, 65536);
+  max_batch_size = jsonb_option_int32(options, "max_batch_size", 4096, min_batch_size, 65536);
+
+  if (entry->index_type == PG_FAISS_INDEX_HNSW) {
+    double multiplier = 1.0;
+    int64 suggested = (int64)(sqrt((double)std::max<int64>(entry->num_vectors, 1)) * 8.0);
+
+    if (mode == PG_FAISS_AUTOTUNE_LATENCY) multiplier = 0.75;
+    if (mode == PG_FAISS_AUTOTUNE_RECALL) multiplier = 1.75;
+    if (target_recall > 0.98) multiplier *= 1.25;
+
+    suggested = (int64)((double)suggested * multiplier);
+    entry->hnsw_ef_search = clamp_int32(suggested, 16, 4096);
+  }
+
+  if (entry->index_type == PG_FAISS_INDEX_IVF_FLAT || entry->index_type == PG_FAISS_INDEX_IVF_PQ) {
+    double multiplier = 1.0;
+    int64 suggested = (int64)(sqrt((double)std::max(entry->ivf_nlist, 1)));
+
+    if (mode == PG_FAISS_AUTOTUNE_LATENCY) multiplier = 0.75;
+    if (mode == PG_FAISS_AUTOTUNE_RECALL) multiplier = 2.0;
+    if (target_recall > 0.98) multiplier *= 1.2;
+
+    suggested = (int64)((double)suggested * multiplier);
+    entry->ivf_nprobe = clamp_int32(suggested, 1, std::max(entry->ivf_nlist, 1));
+  }
+
+  {
+    int64 base_batch = (entry->device == PG_FAISS_DEVICE_GPU) ? 2048 : 256;
+    int64 dim_penalty = std::max(entry->dim, 1) / 16;
+
+    if (mode == PG_FAISS_AUTOTUNE_LATENCY) base_batch = base_batch / 2;
+    if (mode == PG_FAISS_AUTOTUNE_RECALL) base_batch = base_batch * 2;
+
+    base_batch = base_batch - dim_penalty;
+    entry->preferred_batch_size = clamp_int32(base_batch, min_batch_size, max_batch_size);
+  }
+
+  {
+    faiss::Index* base = unwrap_idmap(active_index(entry));
+    faiss::IndexHNSW* hnsw = dynamic_cast<faiss::IndexHNSW*>(base);
+    faiss::IndexIVF* ivf = dynamic_cast<faiss::IndexIVF*>(base);
+
+    if (hnsw != NULL) hnsw->hnsw.efSearch = entry->hnsw_ef_search;
+    if (ivf != NULL) ivf->nprobe = entry->ivf_nprobe;
+  }
+
+  entry->autotune_calls++;
+  entry->last_autotune_mode = mode;
+
+  initStringInfo(&json);
+  appendStringInfoChar(&json, '{');
+  appendStringInfo(&json, "\"name\":\"%s\",", entry->name);
+  appendStringInfo(&json, "\"mode\":\"%s\",", autotune_mode_name(mode));
+  appendStringInfo(&json, "\"target_recall\":%.4f,", target_recall);
+  appendStringInfo(&json, "\"hnsw_ef_search\":{\"old\":%d,\"new\":%d},", old_hnsw_ef_search,
+                   entry->hnsw_ef_search);
+  appendStringInfo(&json, "\"ivf_nprobe\":{\"old\":%d,\"new\":%d},", old_ivf_nprobe,
+                   entry->ivf_nprobe);
+  appendStringInfo(&json, "\"preferred_batch_size\":{\"old\":%d,\"new\":%d}", old_batch_size,
+                   entry->preferred_batch_size);
+  appendStringInfoChar(&json, '}');
+  result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.data));
+
+  pfree(name);
+  pfree(mode_text);
+  PG_RETURN_DATUM(result);
+}
+
+extern "C" Datum pg_faiss_metrics_reset(PG_FUNCTION_ARGS) {
+  HASH_SEQ_STATUS status;
+  PgFaissIndexEntry* entry;
+
+  ensure_registry();
+
+  if (PG_ARGISNULL(0)) {
+    hash_seq_init(&status, pg_faiss_registry);
+    while ((entry = (PgFaissIndexEntry*)hash_seq_search(&status)) != NULL)
+      reset_runtime_stats(entry, false);
+  } else {
+    char* name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+    entry = lookup_entry(name);
+    if (entry == NULL)
+      ereport(ERROR,
+              (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("index \"%s\" does not exist", name)));
+
+    reset_runtime_stats(entry, false);
+    pfree(name);
+  }
+
   PG_RETURN_VOID();
 }
 
@@ -1007,6 +1495,35 @@ extern "C" Datum pg_faiss_index_stats(PG_FUNCTION_ARGS) {
   appendStringInfo(&json, "\"ivf\":{\"nlist\":%d,\"nprobe\":%d},", entry->ivf_nlist,
                    entry->ivf_nprobe);
   appendStringInfo(&json, "\"ivfpq\":{\"m\":%d,\"bits\":%d},", entry->ivfpq_m, entry->ivfpq_bits);
+  appendStringInfo(
+      &json,
+      "\"runtime\":{\"train_calls\":%lld,\"add_calls\":%lld,\"add_vectors_total\":%lld,"
+      "\"search_single_calls\":%lld,\"search_batch_calls\":%lld,\"search_filtered_calls\":%lld,"
+      "\"search_query_total\":%lld,\"search_result_total\":%lld,\"save_calls\":%lld,"
+      "\"load_calls\":%lld,\"autotune_calls\":%lld,\"error_calls\":%lld,"
+      "\"search_single_ms_total\":%.4f,\"search_batch_ms_total\":%.4f,"
+      "\"search_filtered_ms_total\":%.4f,\"search_single_ms_avg\":%.4f,"
+      "\"search_batch_ms_avg\":%.4f,\"search_filtered_ms_avg\":%.4f,"
+      "\"last_candidate_k\":%d,\"last_batch_size\":%d,\"preferred_batch_size\":%d,"
+      "\"last_autotune_mode\":\"%s\"},",
+      (long long)entry->train_calls, (long long)entry->add_calls,
+      (long long)entry->add_vectors_total, (long long)entry->search_single_calls,
+      (long long)entry->search_batch_calls, (long long)entry->search_filtered_calls,
+      (long long)entry->search_query_total, (long long)entry->search_result_total,
+      (long long)entry->save_calls, (long long)entry->load_calls, (long long)entry->autotune_calls,
+      (long long)entry->error_calls, entry->search_single_ms_total, entry->search_batch_ms_total,
+      entry->search_filtered_ms_total,
+      entry->search_single_calls > 0
+          ? entry->search_single_ms_total / (double)entry->search_single_calls
+          : 0.0,
+      entry->search_batch_calls > 0
+          ? entry->search_batch_ms_total / (double)entry->search_batch_calls
+          : 0.0,
+      entry->search_filtered_calls > 0
+          ? entry->search_filtered_ms_total / (double)entry->search_filtered_calls
+          : 0.0,
+      entry->last_candidate_k, entry->last_batch_size, entry->preferred_batch_size,
+      autotune_mode_name(entry->last_autotune_mode));
   appendStringInfo(&json, "\"index_path\":");
   escape_json(&json, entry->index_path);
 

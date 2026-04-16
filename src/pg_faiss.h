@@ -37,6 +37,11 @@ enum PgFaissIndexType {
 };
 
 enum PgFaissDeviceType { PG_FAISS_DEVICE_CPU = 0, PG_FAISS_DEVICE_GPU = 1 };
+enum PgFaissAutotuneMode {
+  PG_FAISS_AUTOTUNE_BALANCED = 0,
+  PG_FAISS_AUTOTUNE_LATENCY = 1,
+  PG_FAISS_AUTOTUNE_RECALL = 2
+};
 
 typedef struct PgFaissIndexEntry {
   char name[PG_FAISS_MAX_INDEX_NAME];
@@ -52,8 +57,27 @@ typedef struct PgFaissIndexEntry {
   int32 ivfpq_m;
   int32 ivfpq_bits;
   int32 gpu_device;
+  int32 preferred_batch_size;
+  int32 last_candidate_k;
+  int32 last_batch_size;
+  int32 last_autotune_mode;
   bool is_trained;
   int64 num_vectors;
+  int64 train_calls;
+  int64 add_calls;
+  int64 add_vectors_total;
+  int64 search_single_calls;
+  int64 search_batch_calls;
+  int64 search_filtered_calls;
+  int64 search_query_total;
+  int64 search_result_total;
+  int64 save_calls;
+  int64 load_calls;
+  int64 autotune_calls;
+  int64 error_calls;
+  double search_single_ms_total;
+  double search_batch_ms_total;
+  double search_filtered_ms_total;
   char index_path[MAXPGPATH];
   faiss::Index* cpu_index;
 #ifdef USE_FAISS_GPU

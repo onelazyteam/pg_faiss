@@ -1,33 +1,34 @@
-# pg_faiss v0.2 API 参考
+# pg_faiss v0.2 API 参考（完整参数版）
 
-## 1. 说明
+## 1. 全局说明
 
-- 所有接口都作用于 `pg_faiss` 的 backend 本地索引注册表（非共享全局状态）。
-- 主输入类型为 `vector` / `vector[]`（依赖 `pgvector` 扩展）。
-- `metric='cosine'` 时，内部走“归一化 + IP”；返回距离会转换为 `1 - inner_product`。
-- 当 `k > 当前索引向量数` 时，实际返回条数为 `min(k, ntotal)`。
-- `void` 返回函数在 SQL 里是“非 NULL 的 void 值”，用 `IS NOT NULL` 断言成功更直观。
+- 所有索引对象都存在于当前 PostgreSQL backend 进程内（非全局共享）。
+- 输入类型依赖 `pgvector`：`vector` / `vector[]`。
+- `metric='cosine'` 使用“归一化 + inner product”；返回值转换为 cosine distance（`1 - ip`）。
+- 当 `k > ntotal` 时，实际返回 `min(k, ntotal)`。
 
-## 2. 函数总览
+## 2. 函数清单
 
-| 函数 | 作用 | 返回 |
+| 函数 | 返回 | 主要用途 |
 |---|---|---|
-| `pg_faiss_index_create` | 创建索引对象并注册到当前 backend | `void` |
-| `pg_faiss_index_train` | 训练 IVF/IVFPQ 索引 | `void` |
-| `pg_faiss_index_add` | 批量写入向量及显式 ID | `bigint`（写入条数） |
-| `pg_faiss_index_search` | 单向量 ANN 检索 | `table(id bigint, distance real)` |
-| `pg_faiss_index_search_batch` | 批量向量 ANN 检索 | `table(query_no int, id bigint, distance real)` |
-| `pg_faiss_index_save` | 保存索引到磁盘 | `void` |
-| `pg_faiss_index_load` | 从磁盘加载索引 | `void` |
-| `pg_faiss_index_stats` | 返回索引统计信息 | `jsonb` |
-| `pg_faiss_index_drop` | 删除一个索引 | `void` |
-| `pg_faiss_reset` | 清空当前 backend 的所有索引 | `void` |
+| `pg_faiss_index_create` | `void` | 创建索引对象 |
+| `pg_faiss_index_train` | `void` | 训练 IVF/IVFPQ |
+| `pg_faiss_index_add` | `bigint` | 批量写入向量 |
+| `pg_faiss_index_search` | `table(id, distance)` | 单向量检索 |
+| `pg_faiss_index_search_batch` | `table(query_no, id, distance)` | 批量检索（优化路径） |
+| `pg_faiss_index_search_filtered` | `table(id, distance)` | 混合检索（单查，ID 过滤） |
+| `pg_faiss_index_search_batch_filtered` | `table(query_no, id, distance)` | 混合检索（批查，ID 过滤） |
+| `pg_faiss_index_autotune` | `jsonb` | 自动调参 |
+| `pg_faiss_metrics_reset` | `void` | 重置 runtime 指标 |
+| `pg_faiss_index_save` | `void` | 保存索引 |
+| `pg_faiss_index_load` | `void` | 加载索引 |
+| `pg_faiss_index_stats` | `jsonb` | 查看元信息+运行指标 |
+| `pg_faiss_index_drop` | `void` | 删除索引 |
+| `pg_faiss_reset` | `void` | 清空当前 backend 全部索引 |
 
 ## 3. 接口详情
 
 ### 3.1 `pg_faiss_index_create`
-
-签名：
 
 ```sql
 pg_faiss_index_create(
@@ -40,90 +41,44 @@ pg_faiss_index_create(
 ) returns void
 ```
 
-作用：创建并初始化索引对象。
-
 参数：
 
-| 参数 | 类型 | 必填 | 含义 | 约束/默认 |
-|---|---|---|---|---|
-| `name` | `text` | 是 | 索引名（当前 backend 内唯一） | 最大 63 字符 |
-| `dim` | `int` | 是 | 向量维度 | `1..65535` |
-| `metric` | `text` | 是 | 距离度量 | `l2` / `ip` / `inner_product` / `cosine` |
-| `index_type` | `text` | 是 | 索引类型 | `hnsw` / `ivfflat` / `ivf_flat` / `ivfpq` / `ivf_pq` |
-| `options` | `jsonb` | 否 | 索引构建参数 | 见下表 |
-| `device` | `text` | 否 | 运行设备 | `cpu`(默认) / `gpu` |
+- `name`: 索引名，当前 backend 内唯一，最长 63 字符。
+- `dim`: 维度，范围 `1..65535`。
+- `metric`: `l2` / `ip` / `inner_product` / `cosine`。
+- `index_type`: `hnsw` / `ivfflat` / `ivf_flat` / `ivfpq` / `ivf_pq`。
+- `options`: 索引参数。
+- `device`: `cpu`（默认）/ `gpu`。
 
-`options` 支持字段：
+`options` 字段：
 
-| 字段 | 作用 | 默认值 | 范围 |
-|---|---|---:|---|
-| `m` | HNSW 连边参数 | `32` | `2..256` |
-| `ef_construction` | HNSW 构建搜索宽度 | `200` | `4..1000000` |
-| `ef_search` | HNSW 默认检索宽度 | `64` | `1..1000000` |
-| `nlist` | IVF 聚类中心数 | `4096` | `1..1000000` |
-| `nprobe` | IVF 默认探测桶数 | `32` | `1..1000000` |
-| `pq_m` | IVFPQ 子量化器数量 | `64` | `1..4096` |
-| `pq_bits` | IVFPQ 每子向量 bit 数 | `8` | `1..16` |
-| `gpu_device` | GPU 设备编号 | `0` | `0..128` |
-
-常见错误：
-
-- 索引名重复。
-- `device='gpu'` 但扩展未用 GPU 编译。
-- 参数越界或类型不匹配（例如 `options` 中传非整数）。
+- `m`（HNSW，默认 32）
+- `ef_construction`（HNSW，默认 200）
+- `ef_search`（HNSW，默认 64）
+- `nlist`（IVF，默认 4096）
+- `nprobe`（IVF，默认 32）
+- `pq_m`（IVFPQ，默认 64）
+- `pq_bits`（IVFPQ，默认 8）
+- `gpu_device`（GPU 卡号，默认 0）
 
 ### 3.2 `pg_faiss_index_train`
-
-签名：
 
 ```sql
 pg_faiss_index_train(name text, training_vectors vector[]) returns void
 ```
 
-作用：训练 IVF/IVFPQ 索引；HNSW 通常无需显式训练（可调用但意义有限）。
-
-参数：
-
-| 参数 | 类型 | 必填 | 含义 | 约束 |
-|---|---|---|---|---|
-| `name` | `text` | 是 | 索引名 | 必须已存在 |
-| `training_vectors` | `vector[]` | 是 | 训练向量集合 | 一维数组、非空、不得含 `NULL`、维度必须等于 `dim` |
-
-常见错误：
-
-- 索引不存在。
-- 训练向量为空、维度不一致或有 `NULL`。
+- `training_vectors` 需为一维、非空、无 NULL、维度匹配。
 
 ### 3.3 `pg_faiss_index_add`
-
-签名：
 
 ```sql
 pg_faiss_index_add(name text, ids bigint[], vectors vector[]) returns bigint
 ```
 
-作用：按显式 ID 批量写入向量。
-
-参数：
-
-| 参数 | 类型 | 必填 | 含义 | 约束 |
-|---|---|---|---|---|
-| `name` | `text` | 是 | 索引名 | 必须已存在 |
-| `ids` | `bigint[]` | 是 | 每个向量对应的业务 ID | 一维数组、非空、不得含 `NULL` |
-| `vectors` | `vector[]` | 是 | 待写入向量 | 一维数组、非空、不得含 `NULL`、维度一致 |
-
-返回：
-
-- `bigint`，成功写入条数（等于 `vectors` 长度）。
-
-常见错误：
-
-- `ids` 与 `vectors` 数量不一致。
-- IVF/IVFPQ 尚未训练（`is_trained=false`）时写入。
+- `ids` 与 `vectors` 数量必须相同。
+- 返回写入条数。
 
 ### 3.4 `pg_faiss_index_search`
-
-签名：
 
 ```sql
 pg_faiss_index_search(
@@ -134,32 +89,13 @@ pg_faiss_index_search(
 ) returns table(id bigint, distance real)
 ```
 
-作用：单向量 ANN 检索。
+`search_params`：
 
-参数：
-
-| 参数 | 类型 | 必填 | 含义 | 约束/默认 |
-|---|---|---|---|---|
-| `name` | `text` | 是 | 索引名 | 必须已存在 |
-| `query` | `vector` | 是 | 查询向量 | 维度必须与索引一致 |
-| `k` | `int` | 是 | 返回 top-k | `>0` |
-| `search_params` | `jsonb` | 否 | 本次查询参数 | 支持 `ef_search`、`nprobe` |
-
-`search_params` 支持字段：
-
-| 字段 | 对应索引 | 含义 | 范围 |
-|---|---|---|---|
-| `ef_search` | HNSW | 本次查询搜索宽度 | `1..1000000` |
-| `nprobe` | IVF/IVFPQ | 本次查询探测桶数 | `1..1000000` |
-
-返回：
-
-- `id`: 向量 ID（`bigint`）
-- `distance`: 距离（`real`）
+- `ef_search`（HNSW 查询宽度）
+- `nprobe`（IVF 探测桶数）
+- `candidate_k`（候选集深度，默认 `k`）
 
 ### 3.5 `pg_faiss_index_search_batch`
-
-签名：
 
 ```sql
 pg_faiss_index_search_batch(
@@ -170,112 +106,134 @@ pg_faiss_index_search_batch(
 ) returns table(query_no int, id bigint, distance real)
 ```
 
-作用：批量 ANN 检索（推荐高吞吐场景使用）。
+`search_params`：
+
+- `ef_search`
+- `nprobe`
+- `candidate_k`
+- `batch_size`（批处理分块大小，默认使用索引的 `preferred_batch_size`）
+
+### 3.6 `pg_faiss_index_search_filtered`
+
+```sql
+pg_faiss_index_search_filtered(
+  name text,
+  query vector,
+  k int,
+  filter_ids bigint[],
+  search_params jsonb default '{}'::jsonb
+) returns table(id bigint, distance real)
+```
+
+作用：ANN 检索后按 `filter_ids` allow-list 过滤，实现混合检索。
+
+### 3.7 `pg_faiss_index_search_batch_filtered`
+
+```sql
+pg_faiss_index_search_batch_filtered(
+  name text,
+  queries vector[],
+  k int,
+  filter_ids bigint[],
+  search_params jsonb default '{}'::jsonb
+) returns table(query_no int, id bigint, distance real)
+```
+
+作用：批量混合检索。每个 query 在过滤后返回 top-k。
+
+### 3.8 `pg_faiss_index_autotune`
+
+```sql
+pg_faiss_index_autotune(
+  name text,
+  mode text default 'balanced',
+  options jsonb default '{}'::jsonb
+) returns jsonb
+```
 
 参数：
 
-| 参数 | 类型 | 必填 | 含义 | 约束 |
-|---|---|---|---|---|
-| `name` | `text` | 是 | 索引名 | 必须已存在 |
-| `queries` | `vector[]` | 是 | 查询向量数组 | 一维、非空、不得含 `NULL`、维度一致 |
-| `k` | `int` | 是 | 每个 query 的 top-k | `>0` |
-| `search_params` | `jsonb` | 否 | 本次查询参数 | 同 `search` |
+- `mode`: `latency` / `balanced` / `recall`
+- `options`:
+  - `target_recall`（默认 0.95）
+  - `min_batch_size`（默认 32）
+  - `max_batch_size`（默认 4096）
 
-返回：
+返回：包含 `hnsw_ef_search` / `ivf_nprobe` / `preferred_batch_size` 的 old/new 对比。
 
-- `query_no`: 输入数组中的 query 序号（从 `1` 开始）
-- `id`: 向量 ID
-- `distance`: 距离
+### 3.9 `pg_faiss_metrics_reset`
 
-### 3.6 `pg_faiss_index_save`
+```sql
+pg_faiss_metrics_reset(name text default null) returns void
+```
 
-签名：
+- `name is null`：重置当前 backend 全部索引 runtime 指标。
+- `name not null`：只重置目标索引 runtime 指标。
+
+### 3.10 `pg_faiss_index_save`
 
 ```sql
 pg_faiss_index_save(name text, path text) returns void
 ```
 
-作用：持久化索引。
+- 主索引写到 `path`
+- 元数据写到 `path.meta`
 
-行为：
-
-- 写入索引主文件：`path`
-- 写入元数据文件：`path.meta`
-
-参数：
-
-| 参数 | 类型 | 必填 | 含义 |
-|---|---|---|---|
-| `name` | `text` | 是 | 索引名 |
-| `path` | `text` | 是 | 目标路径 |
-
-### 3.7 `pg_faiss_index_load`
-
-签名：
+### 3.11 `pg_faiss_index_load`
 
 ```sql
 pg_faiss_index_load(name text, path text, device text default 'cpu') returns void
 ```
 
-作用：从磁盘加载索引并注册为新名称。
+- 将磁盘索引加载为新索引名。
 
-参数：
-
-| 参数 | 类型 | 必填 | 含义 | 约束/默认 |
-|---|---|---|---|---|
-| `name` | `text` | 是 | 新索引名 | 当前 backend 中不得已存在 |
-| `path` | `text` | 是 | 索引文件路径 | 需可读 |
-| `device` | `text` | 否 | 加载后运行设备 | `cpu`(默认) / `gpu` |
-
-说明：
-
-- 若存在 `path.meta`，会优先用其中参数恢复 `metric/index_type` 等信息。
-- 若不存在 `path.meta`，会根据索引对象类型推断。
-
-### 3.8 `pg_faiss_index_stats`
-
-签名：
+### 3.12 `pg_faiss_index_stats`
 
 ```sql
 pg_faiss_index_stats(name text) returns jsonb
 ```
 
-作用：返回索引状态与参数快照。
+包含三类信息：
 
-关键字段：
+- 元信息：`name/version/dim/metric/index_type/device`
+- 参数：`hnsw/ivf/ivfpq`
+- 运行指标：`runtime.*`（调用量、耗时、候选深度、batch 参数、autotune 状态等）
 
-- `name`, `version`, `dim`, `metric`, `index_type`, `device`
-- `num_vectors`, `is_trained`
-- `hnsw.m`, `hnsw.ef_construction`, `hnsw.ef_search`
-- `ivf.nlist`, `ivf.nprobe`
-- `ivfpq.m`, `ivfpq.bits`
-- `index_path`
-
-### 3.9 `pg_faiss_index_drop`
-
-签名：
+### 3.13 `pg_faiss_index_drop`
 
 ```sql
 pg_faiss_index_drop(name text) returns void
 ```
 
-作用：删除一个索引并释放资源。
-
-### 3.10 `pg_faiss_reset`
-
-签名：
+### 3.14 `pg_faiss_reset`
 
 ```sql
 pg_faiss_reset() returns void
 ```
 
-作用：清空当前 backend 中所有 pg_faiss 索引。
+## 4. 常见错误
 
-## 4. 最小示例
+- 参数类型或范围非法：`ERRCODE_INVALID_PARAMETER_VALUE`
+- 索引不存在：`ERRCODE_UNDEFINED_OBJECT`
+- 状态非法（例如未训练就写入 IVF）：`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`
+- FAISS 运行异常：`ERRCODE_EXTERNAL_ROUTINE_EXCEPTION`
+
+## 5. 混合检索示例（工业常见模式）
 
 ```sql
-SELECT pg_faiss_index_create('demo', 4, 'l2', 'hnsw', '{}'::jsonb, 'cpu');
-SELECT pg_faiss_index_add('demo', ARRAY[1]::bigint[], ARRAY['[0,1,2,3]'::vector]::vector[]);
-SELECT * FROM pg_faiss_index_search('demo', '[0,1,2,3]'::vector, 5, '{}'::jsonb);
-SELECT pg_faiss_index_drop('demo');
+WITH allow_list AS (
+  SELECT array_agg(id ORDER BY id) AS ids
+  FROM product_embedding
+  WHERE tenant_id = 42
+    AND category = 'electronics'
+    AND is_active = true
+)
+SELECT *
+FROM pg_faiss_index_search_filtered(
+  'prod_idx',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  20,
+  (SELECT ids FROM allow_list),
+  '{"candidate_k":200,"ef_search":128}'::jsonb
+);
 ```

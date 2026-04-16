@@ -29,6 +29,16 @@ SELECT id
 FROM pg_faiss_index_search('idx_h', '[1,0,0,0]'::vector, 2, '{}'::jsonb)
 ORDER BY distance, id;
 
+SELECT id
+FROM pg_faiss_index_search_filtered(
+    'idx_h',
+    '[1,0,0,0]'::vector,
+    2,
+    ARRAY[2,4]::bigint[],
+    '{"candidate_k":4}'::jsonb
+)
+ORDER BY distance, id;
+
 SELECT count(*) AS batch_rows
 FROM pg_faiss_index_search_batch(
     'idx_h',
@@ -36,6 +46,23 @@ FROM pg_faiss_index_search_batch(
     2,
     '{}'::jsonb
 );
+
+SELECT count(*) AS filtered_batch_rows
+FROM pg_faiss_index_search_batch_filtered(
+    'idx_h',
+    ARRAY['[1,0,0,0]'::vector, '[4,0,0,0]'::vector]::vector[],
+    2,
+    ARRAY[1,4]::bigint[],
+    '{"candidate_k":4,"batch_size":1}'::jsonb
+);
+
+SELECT (pg_faiss_index_autotune('idx_h', 'balanced', '{"target_recall":0.97}'::jsonb)
+        -> 'preferred_batch_size' ->> 'new')::int > 0 AS autotune_ok;
+
+SELECT (pg_faiss_index_stats('idx_h')->'runtime'->>'search_filtered_calls')::int >= 2 AS runtime_filtered_ok;
+
+SELECT pg_faiss_metrics_reset('idx_h') IS NOT NULL AS metrics_reset_ok;
+SELECT (pg_faiss_index_stats('idx_h')->'runtime'->>'search_query_total')::int AS search_query_total_after_reset;
 
 SELECT pg_faiss_index_save('idx_h', '/tmp/pg_faiss_regress.idx') IS NOT NULL AS save_ok;
 SELECT pg_faiss_index_drop('idx_h') IS NOT NULL AS drop_hnsw_ok;

@@ -10,6 +10,10 @@ FAISS-based vector search extension for PostgreSQL (v0.2).
 - Index types: `hnsw`, `ivfflat`, `ivfpq`
 - Metrics: `l2`, `ip`, `cosine`
 - CPU path + optional GPU path (`USE_FAISS_GPU=1`)
+- P0 observability: built-in runtime counters and timings
+- P1 hybrid retrieval: `ANN + ID allow-list` for single and batch search
+- P1 auto tuning: `latency/balanced/recall` modes
+- P1 batch query optimization: chunked execution (`batch_size`) + candidate depth (`candidate_k`)
 - Versioned extension SQL (`pg_faiss--0.2.0.sql`)
 - Regression + TAP tests (correctness, recall, performance)
 
@@ -134,6 +138,10 @@ prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
 - `pg_faiss_index_add(name, ids, vectors)`
 - `pg_faiss_index_search(name, query, k, search_params)`
 - `pg_faiss_index_search_batch(name, queries, k, search_params)`
+- `pg_faiss_index_search_filtered(name, query, k, filter_ids, search_params)`
+- `pg_faiss_index_search_batch_filtered(name, queries, k, filter_ids, search_params)`
+- `pg_faiss_index_autotune(name, mode, options)`
+- `pg_faiss_metrics_reset(name default null)`
 - `pg_faiss_index_save(name, path)` / `pg_faiss_index_load(name, path, device)`
 - `pg_faiss_index_stats(name)`
 - `pg_faiss_index_drop(name)` / `pg_faiss_reset()`

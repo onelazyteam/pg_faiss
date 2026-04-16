@@ -63,6 +63,26 @@ CREATE FUNCTION pg_faiss_index_search_batch(
 AS 'MODULE_PATHNAME', 'pg_faiss_index_search_batch'
 LANGUAGE C VOLATILE STRICT;
 
+CREATE FUNCTION pg_faiss_index_search_filtered(
+    name text,
+    query vector,
+    k integer,
+    filter_ids bigint[],
+    search_params jsonb DEFAULT '{}'::jsonb
+) RETURNS TABLE(id bigint, distance real)
+AS 'MODULE_PATHNAME', 'pg_faiss_index_search_filtered'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION pg_faiss_index_search_batch_filtered(
+    name text,
+    queries vector[],
+    k integer,
+    filter_ids bigint[],
+    search_params jsonb DEFAULT '{}'::jsonb
+) RETURNS TABLE(query_no integer, id bigint, distance real)
+AS 'MODULE_PATHNAME', 'pg_faiss_index_search_batch_filtered'
+LANGUAGE C VOLATILE STRICT;
+
 CREATE FUNCTION pg_faiss_index_save(
     name text,
     path text
@@ -77,6 +97,19 @@ CREATE FUNCTION pg_faiss_index_load(
 ) RETURNS void
 AS 'MODULE_PATHNAME', 'pg_faiss_index_load'
 LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION pg_faiss_index_autotune(
+    name text,
+    mode text DEFAULT 'balanced',
+    options jsonb DEFAULT '{}'::jsonb
+) RETURNS jsonb
+AS 'MODULE_PATHNAME', 'pg_faiss_index_autotune'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION pg_faiss_metrics_reset(name text DEFAULT NULL)
+RETURNS void
+AS 'MODULE_PATHNAME', 'pg_faiss_metrics_reset'
+LANGUAGE C VOLATILE;
 
 CREATE FUNCTION pg_faiss_index_stats(name text)
 RETURNS jsonb

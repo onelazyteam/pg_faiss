@@ -1,33 +1,34 @@
-# pg_faiss v0.2 API Reference
+# pg_faiss v0.2 API Reference (Detailed)
 
-## 1. Notes
+## 1. Global Notes
 
-- All APIs operate on a backend-local in-memory registry (not shared across PostgreSQL sessions/backends).
-- Primary input types are `vector` / `vector[]` from `pgvector`.
-- For `metric='cosine'`, pg_faiss normalizes vectors and runs IP internally; returned distance is converted to `1 - inner_product`.
-- If `k > ntotal`, the effective top-k is `min(k, ntotal)`.
-- For `void`-return functions, SQL evaluates them as non-`NULL` void values; `IS NOT NULL` is the practical success check.
+- Index objects are backend-local (not globally shared across sessions).
+- Input types are provided by `pgvector`: `vector` / `vector[]`.
+- `metric='cosine'` is implemented as normalized inner product; returned distance is `1 - ip`.
+- Effective return count is always `min(k, ntotal)`.
 
-## 2. API Overview
+## 2. Function List
 
-| Function | Purpose | Return |
+| Function | Return | Purpose |
 |---|---|---|
-| `pg_faiss_index_create` | Create and register an index object in current backend | `void` |
-| `pg_faiss_index_train` | Train IVF/IVFPQ index | `void` |
-| `pg_faiss_index_add` | Bulk add vectors with explicit IDs | `bigint` (rows added) |
-| `pg_faiss_index_search` | Single-vector ANN search | `table(id bigint, distance real)` |
-| `pg_faiss_index_search_batch` | Batch ANN search | `table(query_no int, id bigint, distance real)` |
-| `pg_faiss_index_save` | Persist index to disk | `void` |
-| `pg_faiss_index_load` | Load index from disk | `void` |
-| `pg_faiss_index_stats` | Return runtime stats | `jsonb` |
-| `pg_faiss_index_drop` | Drop one index | `void` |
-| `pg_faiss_reset` | Drop all pg_faiss indexes in current backend | `void` |
+| `pg_faiss_index_create` | `void` | Create index object |
+| `pg_faiss_index_train` | `void` | Train IVF/IVFPQ |
+| `pg_faiss_index_add` | `bigint` | Bulk insert vectors |
+| `pg_faiss_index_search` | `table(id, distance)` | Single-query ANN |
+| `pg_faiss_index_search_batch` | `table(query_no, id, distance)` | Batch ANN (optimized path) |
+| `pg_faiss_index_search_filtered` | `table(id, distance)` | Hybrid retrieval (single query, ID filter) |
+| `pg_faiss_index_search_batch_filtered` | `table(query_no, id, distance)` | Hybrid retrieval (batch query, ID filter) |
+| `pg_faiss_index_autotune` | `jsonb` | Auto tune defaults |
+| `pg_faiss_metrics_reset` | `void` | Reset runtime counters |
+| `pg_faiss_index_save` | `void` | Persist index |
+| `pg_faiss_index_load` | `void` | Load index |
+| `pg_faiss_index_stats` | `jsonb` | Metadata + runtime metrics |
+| `pg_faiss_index_drop` | `void` | Drop index |
+| `pg_faiss_reset` | `void` | Drop all indexes in current backend |
 
-## 3. Detailed API
+## 3. API Details
 
 ### 3.1 `pg_faiss_index_create`
-
-Signature:
 
 ```sql
 pg_faiss_index_create(
@@ -40,85 +41,44 @@ pg_faiss_index_create(
 ) returns void
 ```
 
-Purpose: create and initialize an index object.
+Arguments:
 
-Parameters:
+- `name`: backend-local unique name, max 63 chars.
+- `dim`: vector dimension, range `1..65535`.
+- `metric`: `l2` / `ip` / `inner_product` / `cosine`.
+- `index_type`: `hnsw` / `ivfflat` / `ivf_flat` / `ivfpq` / `ivf_pq`.
+- `options`: index build options.
+- `device`: `cpu` (default) / `gpu`.
 
-| Param | Type | Required | Meaning | Constraints / Default |
-|---|---|---|---|---|
-| `name` | `text` | Yes | Index name (unique in current backend) | Max 63 chars |
-| `dim` | `int` | Yes | Vector dimensionality | `1..65535` |
-| `metric` | `text` | Yes | Distance metric | `l2` / `ip` / `inner_product` / `cosine` |
-| `index_type` | `text` | Yes | Index type | `hnsw` / `ivfflat` / `ivf_flat` / `ivfpq` / `ivf_pq` |
-| `options` | `jsonb` | No | Build-time parameters | See table below |
-| `device` | `text` | No | Runtime device | `cpu` (default) / `gpu` |
+Supported `options`:
 
-Supported `options` keys:
-
-| Key | Meaning | Default | Range |
-|---|---|---:|---|
-| `m` | HNSW connectivity | `32` | `2..256` |
-| `ef_construction` | HNSW build search width | `200` | `4..1000000` |
-| `ef_search` | Default HNSW search width | `64` | `1..1000000` |
-| `nlist` | IVF cluster count | `4096` | `1..1000000` |
-| `nprobe` | Default IVF probes | `32` | `1..1000000` |
-| `pq_m` | IVFPQ subquantizers | `64` | `1..4096` |
-| `pq_bits` | IVFPQ bits per subvector | `8` | `1..16` |
-| `gpu_device` | GPU device ordinal | `0` | `0..128` |
-
-Common errors:
-
-- Duplicate index name.
-- `device='gpu'` while extension is built without GPU support.
-- Out-of-range values or non-integer `options` values.
+- `m` (HNSW, default 32)
+- `ef_construction` (HNSW, default 200)
+- `ef_search` (HNSW, default 64)
+- `nlist` (IVF, default 4096)
+- `nprobe` (IVF, default 32)
+- `pq_m` (IVFPQ, default 64)
+- `pq_bits` (IVFPQ, default 8)
+- `gpu_device` (GPU id, default 0)
 
 ### 3.2 `pg_faiss_index_train`
-
-Signature:
 
 ```sql
 pg_faiss_index_train(name text, training_vectors vector[]) returns void
 ```
 
-Purpose: train IVF/IVFPQ indexes. (HNSW does not require explicit training.)
-
-Parameters:
-
-| Param | Type | Required | Meaning | Constraints |
-|---|---|---|---|---|
-| `name` | `text` | Yes | Index name | Must exist |
-| `training_vectors` | `vector[]` | Yes | Training vectors | 1D, non-empty, no `NULL`, must match `dim` |
+- `training_vectors` must be one-dimensional, non-empty, no NULLs, and dimension-matched.
 
 ### 3.3 `pg_faiss_index_add`
-
-Signature:
 
 ```sql
 pg_faiss_index_add(name text, ids bigint[], vectors vector[]) returns bigint
 ```
 
-Purpose: bulk add vectors with explicit IDs.
-
-Parameters:
-
-| Param | Type | Required | Meaning | Constraints |
-|---|---|---|---|---|
-| `name` | `text` | Yes | Index name | Must exist |
-| `ids` | `bigint[]` | Yes | External/business IDs | 1D, non-empty, no `NULL` |
-| `vectors` | `vector[]` | Yes | Vector payload | 1D, non-empty, no `NULL`, dims must match |
-
-Return:
-
-- `bigint`: number of vectors added.
-
-Common errors:
-
-- `ids` and `vectors` length mismatch.
-- IVF/IVFPQ index not trained yet.
+- `ids` and `vectors` must have identical length.
+- Returns number of vectors inserted.
 
 ### 3.4 `pg_faiss_index_search`
-
-Signature:
 
 ```sql
 pg_faiss_index_search(
@@ -129,32 +89,13 @@ pg_faiss_index_search(
 ) returns table(id bigint, distance real)
 ```
 
-Purpose: ANN search for a single query vector.
+`search_params`:
 
-Parameters:
-
-| Param | Type | Required | Meaning | Constraints / Default |
-|---|---|---|---|---|
-| `name` | `text` | Yes | Index name | Must exist |
-| `query` | `vector` | Yes | Query vector | Must match index dim |
-| `k` | `int` | Yes | Top-k | `>0` |
-| `search_params` | `jsonb` | No | Per-query runtime params | Supports `ef_search`, `nprobe` |
-
-Supported `search_params` keys:
-
-| Key | Applies to | Meaning | Range |
-|---|---|---|---|
-| `ef_search` | HNSW | Query-time search width | `1..1000000` |
-| `nprobe` | IVF/IVFPQ | Query-time probes | `1..1000000` |
-
-Return columns:
-
-- `id`: vector ID
-- `distance`: distance score
+- `ef_search` (HNSW query breadth)
+- `nprobe` (IVF probes)
+- `candidate_k` (candidate depth, default `k`)
 
 ### 3.5 `pg_faiss_index_search_batch`
-
-Signature:
 
 ```sql
 pg_faiss_index_search_batch(
@@ -165,112 +106,134 @@ pg_faiss_index_search_batch(
 ) returns table(query_no int, id bigint, distance real)
 ```
 
-Purpose: ANN search for multiple query vectors in one call (recommended for high throughput).
+`search_params`:
 
-Parameters:
+- `ef_search`
+- `nprobe`
+- `candidate_k`
+- `batch_size` (chunk size, default = index `preferred_batch_size`)
 
-| Param | Type | Required | Meaning | Constraints |
-|---|---|---|---|---|
-| `name` | `text` | Yes | Index name | Must exist |
-| `queries` | `vector[]` | Yes | Query vector array | 1D, non-empty, no `NULL`, dims must match |
-| `k` | `int` | Yes | Top-k per query | `>0` |
-| `search_params` | `jsonb` | No | Per-query runtime params | Same as `search` |
+### 3.6 `pg_faiss_index_search_filtered`
 
-Return columns:
+```sql
+pg_faiss_index_search_filtered(
+  name text,
+  query vector,
+  k int,
+  filter_ids bigint[],
+  search_params jsonb default '{}'::jsonb
+) returns table(id bigint, distance real)
+```
 
-- `query_no`: 1-based position in input `queries[]`
-- `id`: vector ID
-- `distance`: distance score
+Performs ANN retrieval and keeps only IDs from `filter_ids`.
 
-### 3.6 `pg_faiss_index_save`
+### 3.7 `pg_faiss_index_search_batch_filtered`
 
-Signature:
+```sql
+pg_faiss_index_search_batch_filtered(
+  name text,
+  queries vector[],
+  k int,
+  filter_ids bigint[],
+  search_params jsonb default '{}'::jsonb
+) returns table(query_no int, id bigint, distance real)
+```
+
+Batch hybrid retrieval with per-query top-k after filtering.
+
+### 3.8 `pg_faiss_index_autotune`
+
+```sql
+pg_faiss_index_autotune(
+  name text,
+  mode text default 'balanced',
+  options jsonb default '{}'::jsonb
+) returns jsonb
+```
+
+Arguments:
+
+- `mode`: `latency` / `balanced` / `recall`
+- `options`:
+  - `target_recall` (default `0.95`)
+  - `min_batch_size` (default `32`)
+  - `max_batch_size` (default `4096`)
+
+Returns JSON old/new diffs for `hnsw_ef_search`, `ivf_nprobe`, and `preferred_batch_size`.
+
+### 3.9 `pg_faiss_metrics_reset`
+
+```sql
+pg_faiss_metrics_reset(name text default null) returns void
+```
+
+- `name is null`: reset runtime counters for all indexes in current backend.
+- `name is not null`: reset only the target index.
+
+### 3.10 `pg_faiss_index_save`
 
 ```sql
 pg_faiss_index_save(name text, path text) returns void
 ```
 
-Purpose: persist index artifacts.
+- Main index file: `path`
+- Sidecar metadata: `path.meta`
 
-Behavior:
-
-- Writes index file to `path`
-- Writes metadata to `path.meta`
-
-Parameters:
-
-| Param | Type | Required | Meaning |
-|---|---|---|---|
-| `name` | `text` | Yes | Index name |
-| `path` | `text` | Yes | Target file path |
-
-### 3.7 `pg_faiss_index_load`
-
-Signature:
+### 3.11 `pg_faiss_index_load`
 
 ```sql
 pg_faiss_index_load(name text, path text, device text default 'cpu') returns void
 ```
 
-Purpose: load index from disk and register it under a new name.
+Loads a persisted index under a new runtime name.
 
-Parameters:
-
-| Param | Type | Required | Meaning | Constraints / Default |
-|---|---|---|---|---|
-| `name` | `text` | Yes | New index name | Must not exist in current backend |
-| `path` | `text` | Yes | Index file path | Must be readable |
-| `device` | `text` | No | Runtime device after load | `cpu` (default) / `gpu` |
-
-Notes:
-
-- If `path.meta` exists, metadata is used to recover metric/index settings.
-- If no metadata exists, pg_faiss infers index type from FAISS object type.
-
-### 3.8 `pg_faiss_index_stats`
-
-Signature:
+### 3.12 `pg_faiss_index_stats`
 
 ```sql
 pg_faiss_index_stats(name text) returns jsonb
 ```
 
-Purpose: return runtime metadata snapshot.
+Returns:
 
-Key fields:
+- Metadata: `name/version/dim/metric/index_type/device`
+- Config snapshots: `hnsw/ivf/ivfpq`
+- Runtime metrics: `runtime.*` (call counts, timing totals/averages, latest candidate/batch knobs, autotune state)
 
-- `name`, `version`, `dim`, `metric`, `index_type`, `device`
-- `num_vectors`, `is_trained`
-- `hnsw.m`, `hnsw.ef_construction`, `hnsw.ef_search`
-- `ivf.nlist`, `ivf.nprobe`
-- `ivfpq.m`, `ivfpq.bits`
-- `index_path`
-
-### 3.9 `pg_faiss_index_drop`
-
-Signature:
+### 3.13 `pg_faiss_index_drop`
 
 ```sql
 pg_faiss_index_drop(name text) returns void
 ```
 
-Purpose: drop one index and free runtime resources.
-
-### 3.10 `pg_faiss_reset`
-
-Signature:
+### 3.14 `pg_faiss_reset`
 
 ```sql
 pg_faiss_reset() returns void
 ```
 
-Purpose: drop all pg_faiss indexes in current backend.
+## 4. Common Errors
 
-## 4. Minimal Example
+- invalid arguments/ranges: `ERRCODE_INVALID_PARAMETER_VALUE`
+- missing index: `ERRCODE_UNDEFINED_OBJECT`
+- invalid runtime state (for example IVF untrained): `ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`
+- FAISS runtime failures: `ERRCODE_EXTERNAL_ROUTINE_EXCEPTION`
+
+## 5. Hybrid Retrieval Example (Production Pattern)
 
 ```sql
-SELECT pg_faiss_index_create('demo', 4, 'l2', 'hnsw', '{}'::jsonb, 'cpu');
-SELECT pg_faiss_index_add('demo', ARRAY[1]::bigint[], ARRAY['[0,1,2,3]'::vector]::vector[]);
-SELECT * FROM pg_faiss_index_search('demo', '[0,1,2,3]'::vector, 5, '{}'::jsonb);
-SELECT pg_faiss_index_drop('demo');
+WITH allow_list AS (
+  SELECT array_agg(id ORDER BY id) AS ids
+  FROM product_embedding
+  WHERE tenant_id = 42
+    AND category = 'electronics'
+    AND is_active = true
+)
+SELECT *
+FROM pg_faiss_index_search_filtered(
+  'prod_idx',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  20,
+  (SELECT ids FROM allow_list),
+  '{"candidate_k":200,"ef_search":128}'::jsonb
+);
 ```

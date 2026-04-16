@@ -45,6 +45,26 @@ CREATE FUNCTION pg_faiss_index_search_batch(
 AS 'MODULE_PATHNAME', 'pg_faiss_index_search_batch'
 LANGUAGE C VOLATILE STRICT;
 
+CREATE FUNCTION pg_faiss_index_search_filtered(
+    name text,
+    query vector,
+    k integer,
+    filter_ids bigint[],
+    search_params jsonb DEFAULT '{}'::jsonb
+) RETURNS TABLE(id bigint, distance real)
+AS 'MODULE_PATHNAME', 'pg_faiss_index_search_filtered'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION pg_faiss_index_search_batch_filtered(
+    name text,
+    queries vector[],
+    k integer,
+    filter_ids bigint[],
+    search_params jsonb DEFAULT '{}'::jsonb
+) RETURNS TABLE(query_no integer, id bigint, distance real)
+AS 'MODULE_PATHNAME', 'pg_faiss_index_search_batch_filtered'
+LANGUAGE C VOLATILE STRICT;
+
 CREATE FUNCTION pg_faiss_index_save(
     name text,
     path text
@@ -59,6 +79,19 @@ CREATE FUNCTION pg_faiss_index_load(
 ) RETURNS void
 AS 'MODULE_PATHNAME', 'pg_faiss_index_load'
 LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION pg_faiss_index_autotune(
+    name text,
+    mode text DEFAULT 'balanced',
+    options jsonb DEFAULT '{}'::jsonb
+) RETURNS jsonb
+AS 'MODULE_PATHNAME', 'pg_faiss_index_autotune'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION pg_faiss_metrics_reset(name text DEFAULT NULL)
+RETURNS void
+AS 'MODULE_PATHNAME', 'pg_faiss_metrics_reset'
+LANGUAGE C VOLATILE;
 
 CREATE FUNCTION pg_faiss_index_stats(name text)
 RETURNS jsonb
@@ -90,11 +123,23 @@ IS 'Search nearest neighbors and return (id, distance).';
 COMMENT ON FUNCTION pg_faiss_index_search_batch(text, vector[], integer, jsonb)
 IS 'Batch nearest-neighbor search and return (query_no, id, distance).';
 
+COMMENT ON FUNCTION pg_faiss_index_search_filtered(text, vector, integer, bigint[], jsonb)
+IS 'Hybrid retrieval: ANN search + ID prefilter list, return (id, distance).';
+
+COMMENT ON FUNCTION pg_faiss_index_search_batch_filtered(text, vector[], integer, bigint[], jsonb)
+IS 'Hybrid retrieval batch path: ANN search + ID prefilter list.';
+
 COMMENT ON FUNCTION pg_faiss_index_save(text, text)
 IS 'Persist index to disk. Metadata is stored at <path>.meta.';
 
 COMMENT ON FUNCTION pg_faiss_index_load(text, text, text)
 IS 'Load persisted index from disk.';
+
+COMMENT ON FUNCTION pg_faiss_index_autotune(text, text, jsonb)
+IS 'Auto tune search defaults (ef_search/nprobe/batch_size) for latency|balanced|recall targets.';
+
+COMMENT ON FUNCTION pg_faiss_metrics_reset(text)
+IS 'Reset runtime observability counters for one index or all indexes when name is NULL.';
 
 COMMENT ON FUNCTION pg_faiss_index_stats(text)
 IS 'Return index metadata and runtime statistics as jsonb.';

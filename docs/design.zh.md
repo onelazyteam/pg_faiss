@@ -1,108 +1,240 @@
-# pg_faiss v0.2 设计文档
+# pg_faiss v0.2 设计文档（研发接手版）
 
-## 1. 目标
+## 1. 文档目的
 
-- 以函数式接口集成 FAISS，不实现新的 PostgreSQL Index AM。
-- 以 `vector` / `vector[]` 作为主数据通道，减少数组拆解与拷贝开销。
-- 支持 CPU 与可选 GPU 两种运行路径。
-- 通过 FAISS 二进制文件 + 轻量元数据文件实现可恢复持久化。
+本设计文档面向后续接手 `pg_faiss` 的研发同学，目标是：
 
-## 1.1 对比基线与依赖版本
+- 说明当前插件的核心架构与执行模型。
+- 说明本期新增能力：
+  - P0 可观测性
+  - P1 混合检索
+  - P1 自动调参
+  - P1 批量查询优化
+- 给出可直接落地的开发、测试、发布接手流程。
+
+## 2. 范围与边界
+
+### 2.1 本期范围
+
+- 采用函数式索引对象 API（不实现 PostgreSQL Index AM）。
+- 输入主通道：`vector` / `vector[]`。
+- 索引类型：`hnsw` / `ivfflat` / `ivfpq`。
+- 设备路径：CPU + 可选 GPU。
+
+### 2.2 非目标
+
+- 不做 shared-memory 全局索引注册（当前是 backend-local）。
+- 不做 WAL 级别一致性复制。
+- 不做 SQL 谓词解析型混合检索（当前采用 ID allow-list 方式）。
+
+## 3. 版本与对比基线
 
 - PostgreSQL：18.3
-- pgvector：0.8.2（本期性能对比基线版本）
-- FAISS：1.14.1（CPU，GPU 为可选构建）
+- pgvector：0.8.2（性能对比基线）
+- FAISS：1.14.1
+- 插件版本：0.2.0
 
-FAISS CPU 安装约定（详细命令见 `docs/usage.zh.md`）：
-- `FAISS_ENABLE_GPU=OFF`
-- `CMAKE_BUILD_TYPE=Release`
-- 安装前缀建议：`$HOME/faiss-install`
+## 4. 总体架构
 
-## 2. 架构
+### 4.1 组件
 
-### 2.1 核心组件
+- 入口文件：`src/pg_faiss.cpp`
+- 元信息定义：`src/pg_faiss.h`
+- SQL 定义：`sql/pg_faiss--0.2.0.sql`
+- 注册表：backend 本地 `HTAB`（键为 index name）
+- 运行态对象：
+  - `cpu_index`（必有）
+  - `gpu_index`（可选，GPU 构建时）
 
-- 扩展入口：`src/pg_faiss.cpp`
-- 索引注册表：按索引名管理的 backend 本地哈希表（`PgFaissIndexEntry`）
-- 运行时索引对象：
-  - 必有 CPU 索引（`faiss::Index*`）
-  - 当 `device='gpu'` 且构建启用 GPU 时，维护 GPU 克隆索引
+### 4.2 生命周期
 
-### 2.2 数据流
+1. `create`：创建索引对象并注册到 hash。
+2. `train`：训练 IVF/IVFPQ。
+3. `add`：按显式 ID 批量写入。
+4. `search`：单查 / 批查 / 混合检索。
+5. `save/load`：索引落盘与恢复。
+6. `drop/reset`：释放单索引或当前 backend 全部索引。
 
-1. `pg_faiss_index_create`
-- 解析 `metric`、`index_type`、`options`、`device`
-- 构建 FAISS 索引（`HNSW` / `IVFFlat` / `IVFPQ`）
-- 用 `IndexIDMap2` 包装以支持显式 ID
+## 5. API 总览（含新增）
 
-2. `pg_faiss_index_train`
-- 将 `vector[]` 转成连续 float 缓冲区
-- cosine 度量下先归一化
-- 训练 IVF 系列索引
+| 函数 | 用途 | 返回 |
+|---|---|---|
+| `pg_faiss_index_create` | 创建索引 | `void` |
+| `pg_faiss_index_train` | 训练索引 | `void` |
+| `pg_faiss_index_add` | 批量写入 | `bigint` |
+| `pg_faiss_index_search` | 单查询 | `table(id, distance)` |
+| `pg_faiss_index_search_batch` | 批查询（优化路径） | `table(query_no, id, distance)` |
+| `pg_faiss_index_search_filtered` | 混合检索（单查，ID 过滤） | `table(id, distance)` |
+| `pg_faiss_index_search_batch_filtered` | 混合检索（批查，ID 过滤） | `table(query_no, id, distance)` |
+| `pg_faiss_index_autotune` | 自动调参 | `jsonb` |
+| `pg_faiss_metrics_reset` | 重置运行时指标 | `void` |
+| `pg_faiss_index_save/load` | 持久化与恢复 | `void` |
+| `pg_faiss_index_stats` | 元信息+运行指标 | `jsonb` |
+| `pg_faiss_index_drop/reset` | 清理资源 | `void` |
 
-3. `pg_faiss_index_add`
-- 解析 `ids bigint[]` 和 `vectors vector[]`
-- 通过 `IndexIDMap2` 批量写入
+## 6. Feature #4：可观测性（P0）
 
-4. `pg_faiss_index_search` / `pg_faiss_index_search_batch`
-- 解析 `search_params`（`ef_search`、`nprobe`）
-- 临时应用检索参数并执行查询
-- 以表结构返回结果
+### 6.1 设计目标
 
-5. `pg_faiss_index_save` / `pg_faiss_index_load`
-- 保存 FAISS 索引二进制（`write_index`）
-- 旁路保存 `<path>.meta` 元数据
-- 加载二进制 + 元数据并重建运行态
+- 线上可快速回答：
+  - 查询调用量是多少？
+  - 单查/批查/混合检索各自耗时如何？
+  - 最近一次候选集大小和 batch 大小是多少？
+  - 自动调参是否被执行过？
 
-## 3. API 列表
+### 6.2 指标模型
 
-| 函数 | 说明 |
-|---|---|
-| `pg_faiss_index_create` | 创建索引与运行参数 |
-| `pg_faiss_index_train` | 训练 IVF 索引 |
-| `pg_faiss_index_add` | 批量写入（显式 ID） |
-| `pg_faiss_index_search` | 单查询 ANN 检索 |
-| `pg_faiss_index_search_batch` | 批查询 ANN 检索 |
-| `pg_faiss_index_save` | 持久化索引与元数据 |
-| `pg_faiss_index_load` | 加载持久化索引 |
-| `pg_faiss_index_stats` | 返回 `jsonb` 统计信息 |
-| `pg_faiss_index_drop` | 删除单个索引 |
-| `pg_faiss_reset` | 清空当前 backend 的全部索引 |
+每个索引维护 runtime counters：
 
-## 4. 默认参数
+- 调用量：`train_calls`, `add_calls`, `search_single_calls`, `search_batch_calls`, `search_filtered_calls`
+- 数据量：`add_vectors_total`, `search_query_total`, `search_result_total`
+- 耗时：`search_single_ms_total`, `search_batch_ms_total`, `search_filtered_ms_total`
+- 运维：`save_calls`, `load_calls`, `autotune_calls`, `error_calls`
+- 最近参数：`last_candidate_k`, `last_batch_size`, `preferred_batch_size`, `last_autotune_mode`
 
-- HNSW：`m=32`、`ef_construction=200`、`ef_search=64`
-- IVFFlat：`nlist=4096`、`nprobe=32`
-- IVFPQ：`nlist=4096`、`pq_m=64`、`pq_bits=8`、`nprobe=32`
-- 度量：`l2`、`ip`、`cosine`（`cosine` 采用归一化 + IP）
+### 6.3 暴露方式
 
-## 5. 测试策略
+- `pg_faiss_index_stats(name)` 新增 `runtime` 字段。
+- `pg_faiss_metrics_reset(name default null)` 可重置单索引或全部索引的 runtime 计数。
 
-- `pg_regress`：覆盖 create/train/add/search/save/load/drop/reset 主流程。
-- TAP Recall：与精确基线比对，要求 `Recall@10 >= 0.95`。
-- TAP 性能：
-  - CPU：对比 pgvector HNSW/IVFFlat，默认目标 5x
-  - GPU：条件执行，默认目标 10x
+### 6.4 写入点
 
-### 5.1 性能方法学
+- `train/add/search*/save/load/autotune` 成功路径更新计数。
+- FAISS 异常路径统一增加 `error_calls`。
 
-- 验收口径：同机、同数据集、同查询集、同召回约束（`Recall@10 >= 95%`）。
-- CPU 门槛：`>=5x`；GPU 门槛：`>=10x`。
-- 重负载验收集：`1M x 768`（由 `test/t/020_perf_cpu_vs_pgvector.pl` 与 `test/t/030_perf_gpu_vs_pgvector.pl` 执行）。
-- README 轻量复现实测：`contrib/pg_faiss/test/bench/bench_cpu_batch_sample.sql`（`20,000 x 128`）。
+## 7. Feature #5：混合检索能力（P1）
 
-### 5.2 本机 CPU 实测快照（2026-04-14，批量查询路径）
+### 7.1 设计目标
 
-- 数据规模：`20,000 x 128`，`29` queries，`k=10`
-- 基线：pgvector 0.8.2
-- 参数：pgvector `hnsw.ef_search=512`、`ivfflat.probes=16`；pg_faiss `ef_search=128`、`nprobe=16`
-- 结果：
-  - HNSW：`11.32x`（pgvector `1.13 ms` vs pg_faiss(batch) `0.10 ms`，Recall@10：`0.9552` vs `1.0`）
-  - IVFFlat：`10.31x`（pgvector `0.76 ms` vs pg_faiss(batch) `0.07 ms`，Recall@10 均为 `1.0`）
+支持工业场景中的“先业务过滤，再 ANN 召回”，例如：
 
-## 6. CI 策略
+- 多租户隔离（`tenant_id`）
+- 品类过滤（`category`）
+- 安全级别过滤（`policy_level`）
 
-- PR/默认流水线：跑正确性 + recall。
-- 主分支/夜间任务：通过环境变量启用重基准：
-  - `PG_FAISS_RUN_PERF=1`
-  - `PG_FAISS_RUN_PERF_GPU=1`
+### 7.2 API 设计
+
+- `pg_faiss_index_search_filtered`
+- `pg_faiss_index_search_batch_filtered`
+
+两者都接收 `filter_ids bigint[]`（allow-list）。
+
+### 7.3 执行策略
+
+1. 使用 FAISS ANN 搜索候选集合（`candidate_k`）。
+2. 按 ID allow-list 做过滤。
+3. 取每个 query 的前 `k`。
+
+### 7.4 参数语义
+
+`search_params` 新增：
+
+- `candidate_k`：候选深度（过滤场景默认放大）
+- `batch_size`：批量查询分块大小
+- 原有：`ef_search`, `nprobe`
+
+### 7.5 限制说明
+
+- 当前混合检索是“ID 预过滤”，不直接解析 SQL 谓词。
+- 如需“过滤后精排”，建议在业务 SQL 层做二次 rerank。
+
+## 8. Feature #6：自动调参（P1）
+
+### 8.1 API
+
+`pg_faiss_index_autotune(name, mode, options)`
+
+- `mode`: `latency` / `balanced` / `recall`
+- `options`:
+  - `target_recall`（默认 0.95）
+  - `min_batch_size`（默认 32）
+  - `max_batch_size`（默认 4096）
+
+### 8.2 调参策略（启发式）
+
+- HNSW：基于 `sqrt(ntotal)` 推导 `ef_search`，按 mode 调整倍数。
+- IVF：基于 `sqrt(nlist)` 推导 `nprobe`，按 mode 调整倍数。
+- Batch：根据设备（CPU/GPU）、维度、mode 推导 `preferred_batch_size`。
+
+### 8.3 生效方式
+
+- 更新 `entry` 默认参数。
+- 同步写回 FAISS 运行态对象（`IndexHNSW` / `IndexIVF`）。
+- 返回 `jsonb`，含 old/new 对比，便于变更审计。
+
+## 9. Feature #8：批量查询优化（P1）
+
+### 9.1 问题
+
+原始批查会一次性分配 `num_queries * k` 缓冲区；大批量时内存高、cache 友好性差。
+
+### 9.2 优化点
+
+- 分块执行：`batch_size` 控制每次送入 FAISS 的 query 数。
+- 有过滤场景支持更深候选：`candidate_k`。
+- 查询参数应用逻辑统一，避免重复设置/恢复代码。
+
+### 9.3 复杂度收益
+
+- 内存峰值从 `O(num_queries * candidate_k)` 降为 `O(batch_size * candidate_k)`。
+- 更适合在线服务高并发批请求。
+
+## 10. 持久化与恢复
+
+- 主文件：FAISS 二进制索引（`path`）
+- 侧车元数据：`path.meta`
+- 保存时以 CPU 可写格式为基准，保证可恢复。
+- 加载时根据 meta 恢复 metric/index_type/参数。
+
+## 11. 错误模型
+
+- 参数错误：`ERRCODE_INVALID_PARAMETER_VALUE`
+- 对象不存在：`ERRCODE_UNDEFINED_OBJECT`
+- 状态错误（未训练等）：`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`
+- 外部 FAISS 异常：`ERRCODE_EXTERNAL_ROUTINE_EXCEPTION`
+
+## 12. 测试策略
+
+### 12.1 回归测试（已覆盖）
+
+`test/sql/pg_faiss_test.sql` 覆盖：
+
+- create/train/add/search/search_batch
+- filtered search / filtered batch
+- autotune + runtime stats 验证
+- metrics_reset
+- save/load/drop/reset
+
+### 12.2 TAP（现有）
+
+- `010_recall.pl`：召回验证
+- `020_perf_cpu_vs_pgvector.pl`：CPU 性能对比
+- `030_perf_gpu_vs_pgvector.pl`：GPU 性能对比（条件执行）
+
+## 13. 研发接手清单
+
+### 13.1 新增索引类型
+
+1. 在 `PgFaissIndexType` 增加枚举。
+2. 修改 `parse_index_type/index_type_name/build_index`。
+3. 更新 SQL/API 文档与回归测试。
+
+### 13.2 新增可观测指标
+
+1. 在 `PgFaissIndexEntry` 增加字段。
+2. 在对应成功/异常路径更新计数。
+3. 在 `pg_faiss_index_stats` 暴露字段。
+4. 补回归断言。
+
+### 13.3 发版检查
+
+1. `make && make installcheck`
+2. TAP（至少 recall）
+3. README/API/Design 中英文同步
+4. SQL 脚本和升级脚本同步
+
+## 14. 后续建议
+
+- 引入 shared-memory 级全局观测视图（跨 backend）。
+- 增加基于真实召回反馈的闭环 autotune。
+- 扩展为 SQL 谓词驱动的混合检索（SPI + 安全白名单）。

@@ -1,8 +1,8 @@
 # pg_faiss v0.2 Usage Guide
 
-## 1. Prerequisites and FAISS Installation
+## 1. Prerequisites and Build
 
-### 1.1 PostgreSQL and pgvector
+### 1.1 Build/install pgvector
 
 ```bash
 cd contrib/pgvector
@@ -10,10 +10,9 @@ make
 make install
 ```
 
-### 1.2 Install FAISS CPU (v1.14.1)
+### 1.2 Build/install FAISS CPU (v1.14.1)
 
 ```bash
-# macOS dependencies
 brew install cmake libomp
 
 git clone --branch v1.14.1 https://github.com/facebookresearch/faiss.git
@@ -31,7 +30,7 @@ cmake --build build -j
 cmake --install build
 ```
 
-### 1.3 Build pg_faiss (CPU)
+### 1.3 Build/install pg_faiss (CPU)
 
 ```bash
 cd contrib/pg_faiss
@@ -56,26 +55,17 @@ CREATE EXTENSION vector;
 CREATE EXTENSION pg_faiss;
 ```
 
-## 3. API examples
+## 3. Quick Start
 
-For full per-parameter API semantics, see [api.md](api.md).
-
-### 3.1 Create index
+### 3.1 Create and insert
 
 ```sql
 SELECT pg_faiss_index_create(
-  'docs_hnsw',
-  768,
-  'cosine',
-  'hnsw',
+  'docs_hnsw', 768, 'cosine', 'hnsw',
   '{"m":32,"ef_construction":200,"ef_search":64}'::jsonb,
   'cpu'
 );
-```
 
-### 3.2 Add vectors
-
-```sql
 SELECT pg_faiss_index_add(
   'docs_hnsw',
   ARRAY[1,2,3]::bigint[],
@@ -87,7 +77,7 @@ SELECT pg_faiss_index_add(
 );
 ```
 
-### 3.3 Search
+### 3.2 Single-query search
 
 ```sql
 SELECT *
@@ -99,7 +89,7 @@ FROM pg_faiss_index_search(
 );
 ```
 
-### 3.4 Batch search
+### 3.3 Batch search (optimized path)
 
 ```sql
 SELECT *
@@ -107,30 +97,63 @@ FROM pg_faiss_index_search_batch(
   'docs_hnsw',
   ARRAY['[0.1,0.2,0.3]'::vector, '[0.0,0.5,0.5]'::vector]::vector[],
   5,
-  '{}'::jsonb
+  '{"batch_size":256}'::jsonb
 );
 ```
 
-### 3.5 IVF train and search
+## 4. New Capabilities
+
+### 4.1 Observability
 
 ```sql
-SELECT pg_faiss_index_create(
-  'docs_ivf',
-  768,
-  'l2',
-  'ivfflat',
-  '{"nlist":4096,"nprobe":32}'::jsonb,
-  'cpu'
-);
-
-SELECT pg_faiss_index_train('docs_ivf', $training_vectors::vector[]);
-SELECT pg_faiss_index_add('docs_ivf', $ids::bigint[], $vectors::vector[]);
-
-SELECT *
-FROM pg_faiss_index_search('docs_ivf', $query::vector, 10, '{"nprobe":32}'::jsonb);
+SELECT pg_faiss_index_stats('docs_hnsw');
+SELECT pg_faiss_metrics_reset('docs_hnsw');
 ```
 
-### 3.6 Save/load
+### 4.2 Hybrid retrieval (ANN + business filtering)
+
+```sql
+WITH allow_list AS (
+  SELECT array_agg(id ORDER BY id) AS ids
+  FROM product_embedding
+  WHERE tenant_id = 42
+    AND category = 'electronics'
+    AND is_active = true
+)
+SELECT *
+FROM pg_faiss_index_search_filtered(
+  'docs_hnsw',
+  '[0.1,0.2,0.3]'::vector,
+  20,
+  (SELECT ids FROM allow_list),
+  '{"candidate_k":200,"ef_search":128}'::jsonb
+);
+```
+
+### 4.3 Auto tuning
+
+```sql
+SELECT pg_faiss_index_autotune(
+  'docs_hnsw',
+  'balanced',
+  '{"target_recall":0.97,"min_batch_size":64,"max_batch_size":2048}'::jsonb
+);
+```
+
+### 4.4 Batch hybrid retrieval
+
+```sql
+SELECT *
+FROM pg_faiss_index_search_batch_filtered(
+  'docs_hnsw',
+  ARRAY['[0.1,0.2,0.3]'::vector, '[0.0,0.5,0.5]'::vector]::vector[],
+  10,
+  ARRAY[1,2,3,4,5]::bigint[],
+  '{"candidate_k":100,"batch_size":128}'::jsonb
+);
+```
+
+## 5. Persistence
 
 ```sql
 SELECT pg_faiss_index_save('docs_hnsw', '/tmp/docs_hnsw.faiss');
@@ -138,27 +161,14 @@ SELECT pg_faiss_index_drop('docs_hnsw');
 SELECT pg_faiss_index_load('docs_hnsw', '/tmp/docs_hnsw.faiss', 'cpu');
 ```
 
-### 3.7 Stats
-
-```sql
-SELECT pg_faiss_index_stats('docs_hnsw');
-```
-
-## 4. Performance and recall tests
-
-### 4.1 pg_regress
+## 6. Testing
 
 ```bash
 make installcheck
-```
-
-### 4.2 Recall TAP
-
-```bash
 prove -I ./test/perl test/t/010_recall.pl
 ```
 
-### 4.3 CPU performance TAP (heavy)
+Heavy benchmark:
 
 ```bash
 PG_FAISS_RUN_PERF=1 \
@@ -168,25 +178,8 @@ PG_FAISS_PERF_QUERIES=100 \
 prove -I ./test/perl test/t/020_perf_cpu_vs_pgvector.pl
 ```
 
-### 4.4 Lightweight reproduction script used by README
+## 7. Read Next
 
-```bash
-psql -d <your_db> -f contrib/pg_faiss/test/bench/bench_cpu_batch_sample.sql
-```
-
-### 4.5 GPU performance TAP (heavy)
-
-```bash
-PG_FAISS_RUN_PERF_GPU=1 \
-PG_FAISS_PERF_GPU_ROWS=1000000 \
-PG_FAISS_PERF_GPU_DIM=768 \
-PG_FAISS_PERF_GPU_QUERIES=100 \
-prove -I ./test/perl test/t/030_perf_gpu_vs_pgvector.pl
-```
-
-## 5. Notes
-
-- Baseline comparison versions: pgvector `0.8.2`, FAISS `1.14.1`.
-- Heavy performance TAP tests are intended for main/nightly CI, not every PR run.
-- GPU tests skip automatically when GPU runtime path is unavailable.
-- `pg_faiss` index registry is backend-local; recreate or load indexes per backend/session as needed.
+- API details: `docs/api.md`
+- design details: `docs/design.md`
+- Chinese docs: `README.zh.md` / `docs/api.zh.md` / `docs/design.zh.md`
