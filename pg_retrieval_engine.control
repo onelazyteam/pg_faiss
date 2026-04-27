@@ -1,6 +1,6 @@
 # pg_retrieval_engine extension
 comment = 'Hybrid retrieval engine with FAISS, pgvector, and full-text search'
-default_version = '0.3.0'
+default_version = '1.0.0'
 module_pathname = '$libdir/pg_retrieval_engine'
 relocatable = false
 requires = 'vector'

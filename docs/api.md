@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.3 API Reference (Detailed)
+# pg_retrieval_engine API Reference (Detailed)
 
 ## 1. Global Notes
 

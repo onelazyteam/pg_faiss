@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.3 Design Index
+# pg_retrieval_engine Design Index
 
 The project is split into mostly independent modules. Keep detailed design notes
 next to the module they describe, and keep this file as the top-level map.

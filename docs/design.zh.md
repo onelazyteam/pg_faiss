@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.3 设计文档索引
+# pg_retrieval_engine 设计文档索引
 
 项目内各模块相对独立，后续设计文档按模块维护；本文件只保留总览和发版检查清单。
 

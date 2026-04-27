@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.3 API 参考（完整参数版）
+# pg_retrieval_engine API 参考（完整参数版）
 
 ## 1. 全局说明
 

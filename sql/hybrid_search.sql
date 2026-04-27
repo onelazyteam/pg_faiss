@@ -1,5 +1,5 @@
 -- Hybrid search SQL and RRF composition examples.
--- Runtime functions are installed by pg_retrieval_engine--0.3.0.sql.
+-- Runtime functions are installed by the current pg_retrieval_engine extension SQL.
 
 -- Example:
 --

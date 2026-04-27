@@ -12,7 +12,7 @@ extern "C" {
 #include <faiss/gpu/StandardGpuResources.h>
 #endif
 
-#define pg_retrieval_engine_VERSION "0.2.0"
+#define pg_retrieval_engine_VERSION "1.0.0"
 #define pg_retrieval_engine_MAX_INDEX_NAME 64
 #define pg_retrieval_engine_MAX_DIMENSIONS 65535
 

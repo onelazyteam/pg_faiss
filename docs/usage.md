@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.3 Usage Guide
+# pg_retrieval_engine Usage Guide
 
 ## 1. Prerequisites and Build
 

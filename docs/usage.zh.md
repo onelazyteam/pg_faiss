@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.3 使用文档
+# pg_retrieval_engine 使用文档
 
 ## 1. 前置依赖与安装
 
