@@ -1,11 +1,12 @@
 :root {
-  --bg: #f7f8f2;
+  --bg: #f6f7f9;
   --card: #ffffff;
   --text: #1f2937;
   --muted: #5b6470;
   --brand: #0f766e;
   --brand-dark: #115e59;
-  --border: #d9dfd0;
+  --accent: #3157a4;
+  --border: #d9dee8;
 }
 
 * {
@@ -16,7 +17,7 @@ body {
   margin: 0;
   font-family: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", sans-serif;
   color: var(--text);
-  background: radial-gradient(circle at top right, #d8efe9 0%, var(--bg) 40%);
+  background: linear-gradient(180deg, #eef6f3 0%, var(--bg) 34%, #ffffff 100%);
 }
 
 .container {
@@ -38,6 +39,17 @@ body {
   font-size: 20px;
   font-weight: 700;
   letter-spacing: 0.4px;
+}
+
+.version {
+  display: inline-block;
+  margin: 22px 0 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--accent);
+  background: #fff;
+  font-weight: 700;
 }
 
 .lang-switch {
@@ -101,7 +113,7 @@ main {
 .card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 8px;
   padding: 18px;
   margin: 14px 0;
 }
@@ -115,6 +127,28 @@ main {
   margin: 0;
   padding-left: 20px;
   line-height: 1.7;
+}
+
+.module-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.module {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  background: #fbfcfe;
+}
+
+.module h3 {
+  margin: 0 0 8px;
+}
+
+.module p {
+  margin: 0;
+  color: var(--muted);
 }
 
 pre {
@@ -163,11 +197,11 @@ th {
 
 .link-card {
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 14px;
   text-decoration: none;
   color: inherit;
-  background: #fafcf8;
+  background: #fbfcfe;
 }
 
 .link-card h3 {

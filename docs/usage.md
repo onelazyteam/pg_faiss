@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.2 Usage Guide
+# pg_retrieval_engine v0.3 Usage Guide
 
 ## 1. Prerequisites and Build
 
@@ -153,6 +153,37 @@ FROM pg_retrieval_engine_index_search_batch_filtered(
 );
 ```
 
+### 4.5 RRF fusion search (pgvector + tsvector)
+
+The application table needs both a vector column and a `tsvector` column:
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{"vector_k":100,"fts_k":100,"rrf_k":60,"vector_operator":"<=>"}'::jsonb
+);
+```
+
+### 4.6 Offline evaluation
+
+```bash
+python3 evals/run_eval.py \
+  --qrels evals/qrels.tsv \
+  --run results/vector.jsonl \
+  --run results/fts.jsonl \
+  --run results/rrf.jsonl \
+  --ks 10,20,100
+```
+
+The output includes Recall@K, NDCG@K, P95 latency, and P99 latency.
+
 ## 5. Persistence
 
 ```sql
@@ -180,6 +211,8 @@ prove -I ./test/perl test/t/020_perf_cpu_vs_pgvector.pl
 
 ## 7. Read Next
 
+- Architecture: `docs/architecture.md`
 - API details: `docs/api.md`
-- design details: `docs/design.md`
-- Chinese docs: `README.zh.md` / `docs/api.zh.md` / `docs/design.zh.md`
+- Benchmark: `docs/benchmark.md`
+- Design details: `docs/design.md`
+- Chinese docs: `README.zh.md`

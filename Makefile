@@ -1,5 +1,5 @@
 EXTENSION = pg_retrieval_engine
-EXTVERSION = 0.2.0
+EXTVERSION = 0.3.0
 
 MODULE_big = pg_retrieval_engine
 

@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.2 使用文档
+# pg_retrieval_engine v0.3 使用文档
 
 ## 1. 前置依赖与安装
 
@@ -153,6 +153,37 @@ FROM pg_retrieval_engine_index_search_batch_filtered(
 );
 ```
 
+### 4.5 RRF 融合检索（pgvector + tsvector）
+
+业务表需要同时具备向量列和 `tsvector` 列：
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{"vector_k":100,"fts_k":100,"rrf_k":60,"vector_operator":"<=>"}'::jsonb
+);
+```
+
+### 4.6 离线评测
+
+```bash
+python3 evals/run_eval.py \
+  --qrels evals/qrels.tsv \
+  --run results/vector.jsonl \
+  --run results/fts.jsonl \
+  --run results/rrf.jsonl \
+  --ks 10,20,100
+```
+
+输出包含 Recall@K、NDCG@K、P95 latency、P99 latency。
+
 ## 5. 持久化
 
 ```sql
@@ -180,6 +211,8 @@ prove -I ./test/perl test/t/020_perf_cpu_vs_pgvector.pl
 
 ## 7. 推荐阅读
 
+- 架构文档：`docs/architecture.zh.md`
 - API 细节：`docs/api.zh.md`
+- Benchmark：`docs/benchmark.zh.md`
 - 设计文档：`docs/design.zh.md`
-- 英文文档：`README.md` / `docs/api.md` / `docs/design.md`
+- 英文文档：`README.md`

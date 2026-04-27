@@ -41,7 +41,7 @@
       return 'https://github.com/' + owner + '/' + repo;
     }
 
-    return 'https://github.com';
+    return 'https://github.com/onelazyteam/pg_retrieval_engine';
   }
 
   const repoUrl = detectRepoUrl();
@@ -52,7 +52,7 @@
   document.querySelectorAll('[data-gh-path]').forEach(function (el) {
     const filePath = el.getAttribute('data-gh-path');
     if (!filePath) return;
-    el.href = repoUrl + '/blob/main/' + filePath;
+    el.href = repoUrl + '/blob/master/' + filePath;
   });
 
   setLang(detectInitialLang());

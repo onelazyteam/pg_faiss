@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.2 API 参考（完整参数版）
+# pg_retrieval_engine v0.3 API 参考（完整参数版）
 
 ## 1. 全局说明
 
@@ -18,6 +18,8 @@
 | `pg_retrieval_engine_index_search_batch` | `table(query_no, id, distance)` | 批量检索（优化路径） |
 | `pg_retrieval_engine_index_search_filtered` | `table(id, distance)` | 混合检索（单查，ID 过滤） |
 | `pg_retrieval_engine_index_search_batch_filtered` | `table(query_no, id, distance)` | 混合检索（批查，ID 过滤） |
+| `pg_retrieval_engine_rrf_fuse` | `table(id, rrf_score, vector_rank, fts_rank)` | 融合两个已排序 ID 列表 |
+| `pg_retrieval_engine_hybrid_search` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | pgvector + `tsvector` RRF 混合检索 |
 | `pg_retrieval_engine_index_autotune` | `jsonb` | 自动调参 |
 | `pg_retrieval_engine_metrics_reset` | `void` | 重置 runtime 指标 |
 | `pg_retrieval_engine_index_save` | `void` | 保存索引 |
@@ -141,7 +143,64 @@ pg_retrieval_engine_index_search_batch_filtered(
 
 作用：批量混合检索。每个 query 在过滤后返回 top-k。
 
-### 3.8 `pg_retrieval_engine_index_autotune`
+### 3.8 `pg_retrieval_engine_rrf_fuse`
+
+```sql
+pg_retrieval_engine_rrf_fuse(
+  vector_ids bigint[],
+  fts_ids bigint[],
+  k int,
+  rrf_k double precision default 60.0,
+  vector_weight double precision default 1.0,
+  fts_weight double precision default 1.0
+) returns table(id bigint, rrf_score double precision, vector_rank int, fts_rank int)
+```
+
+作用：对两个已按相关性排序的 ID 列表执行 Reciprocal Rank Fusion。rank 从 1 开始，缺失 rank 贡献 0。
+
+公式：
+
+```text
+score = vector_weight / (rrf_k + vector_rank)
+      + fts_weight    / (rrf_k + fts_rank)
+```
+
+### 3.9 `pg_retrieval_engine_hybrid_search`
+
+```sql
+pg_retrieval_engine_hybrid_search(
+  table_name regclass,
+  id_column name,
+  vector_column name,
+  tsvector_column name,
+  query_vector vector,
+  query_tsquery tsquery,
+  k int,
+  options jsonb default '{}'::jsonb
+) returns table(
+  id bigint,
+  rrf_score double precision,
+  vector_rank int,
+  fts_rank int,
+  vector_distance real,
+  fts_score real
+)
+```
+
+作用：在同一张表上执行 pgvector 距离排序和 PostgreSQL `tsvector` 全文排序，然后用 RRF 输出统一 top-k。
+
+`options` 字段：
+
+- `vector_k` / `dense_k`：向量候选深度，默认 `k * 4`
+- `fts_k` / `sparse_k`：全文候选深度，默认 `k * 4`
+- `rrf_k`：RRF 平滑常数，默认 `60`
+- `vector_weight` / `dense_weight`：向量结果权重，默认 `1`
+- `fts_weight` / `sparse_weight`：全文结果权重，默认 `1`
+- `vector_operator`：`<=>`（默认，cosine distance）/ `<->`（L2）/ `<#>`（negative inner product）
+- `rank_function`：`ts_rank_cd`（默认）/ `ts_rank`
+- `normalization`：全文 rank normalization，默认 `32`
+
+### 3.10 `pg_retrieval_engine_index_autotune`
 
 ```sql
 pg_retrieval_engine_index_autotune(
@@ -161,7 +220,7 @@ pg_retrieval_engine_index_autotune(
 
 返回：包含 `hnsw_ef_search` / `ivf_nprobe` / `preferred_batch_size` 的 old/new 对比。
 
-### 3.9 `pg_retrieval_engine_metrics_reset`
+### 3.11 `pg_retrieval_engine_metrics_reset`
 
 ```sql
 pg_retrieval_engine_metrics_reset(name text default null) returns void
@@ -170,7 +229,7 @@ pg_retrieval_engine_metrics_reset(name text default null) returns void
 - `name is null`：重置当前 backend 全部索引 runtime 指标。
 - `name not null`：只重置目标索引 runtime 指标。
 
-### 3.10 `pg_retrieval_engine_index_save`
+### 3.12 `pg_retrieval_engine_index_save`
 
 ```sql
 pg_retrieval_engine_index_save(name text, path text) returns void
@@ -179,7 +238,7 @@ pg_retrieval_engine_index_save(name text, path text) returns void
 - 主索引写到 `path`
 - 元数据写到 `path.meta`
 
-### 3.11 `pg_retrieval_engine_index_load`
+### 3.13 `pg_retrieval_engine_index_load`
 
 ```sql
 pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') returns void
@@ -187,7 +246,7 @@ pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') 
 
 - 将磁盘索引加载为新索引名。
 
-### 3.12 `pg_retrieval_engine_index_stats`
+### 3.14 `pg_retrieval_engine_index_stats`
 
 ```sql
 pg_retrieval_engine_index_stats(name text) returns jsonb
@@ -199,16 +258,32 @@ pg_retrieval_engine_index_stats(name text) returns jsonb
 - 参数：`hnsw/ivf/ivfpq`
 - 运行指标：`runtime.*`（调用量、耗时、候选深度、batch 参数、autotune 状态等）
 
-### 3.13 `pg_retrieval_engine_index_drop`
+### 3.15 `pg_retrieval_engine_index_drop`
 
 ```sql
 pg_retrieval_engine_index_drop(name text) returns void
 ```
 
-### 3.14 `pg_retrieval_engine_reset`
+### 3.16 `pg_retrieval_engine_reset`
 
 ```sql
 pg_retrieval_engine_reset() returns void
+```
+
+### RRF 融合
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{"vector_k":100,"fts_k":100,"rrf_k":60,"vector_operator":"<=>"}'::jsonb
+);
 ```
 
 ## 4. 常见错误

@@ -1,2 +1,27 @@
--- Draft scaffold: evaluation query templates.
--- Not wired into extension install path yet.
+-- Evaluation query templates.
+-- Not wired into extension install path; intended for benchmark/eval export.
+
+-- Query-level JSONL shape expected by evals/run_eval.py:
+-- {"qid":"q1","method":"rrf","latency_ms":4.2,"results":[{"id":"d1"},{"id":"d2"}]}
+
+-- Example RRF export query. Replace eval_queries/query parameters with the
+-- dataset-specific source.
+--
+-- SELECT jsonb_build_object(
+--   'qid', q.qid,
+--   'method', 'rrf',
+--   'latency_ms', NULL,
+--   'results', jsonb_agg(jsonb_build_object('id', r.id) ORDER BY r.rrf_score DESC)
+-- )
+-- FROM eval_queries q
+-- CROSS JOIN LATERAL pg_retrieval_engine_hybrid_search(
+--   'documents'::regclass,
+--   'id',
+--   'embedding',
+--   'search_vector',
+--   q.query_vector,
+--   q.query_tsquery,
+--   100,
+--   '{"vector_k":200,"fts_k":200,"rrf_k":60}'::jsonb
+-- ) r
+-- GROUP BY q.qid;

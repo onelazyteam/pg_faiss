@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>pg_retrieval_engine | FAISS for PostgreSQL</title>
-  <meta name="description" content="pg_retrieval_engine: FAISS-based vector search extension for PostgreSQL.">
+  <title>pg_retrieval_engine | Hybrid Retrieval for PostgreSQL</title>
+  <meta name="description" content="pg_retrieval_engine: PostgreSQL hybrid retrieval with FAISS, pgvector, full-text search, RRF fusion, and offline evaluation.">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -17,20 +17,21 @@
           <button id="lang-en" class="lang-btn" type="button">English</button>
         </div>
       </div>
+      <p class="version">v0.3</p>
       <h1>
-        <span class="lang lang-zh">FAISS 驱动的 PostgreSQL 向量检索扩展</span>
-        <span class="lang lang-en">FAISS-powered vector search extension for PostgreSQL</span>
+        <span class="lang lang-zh">PostgreSQL 内的混合检索引擎</span>
+        <span class="lang lang-en">Hybrid retrieval engine inside PostgreSQL</span>
       </h1>
       <p class="subtitle">
-        <span class="lang lang-zh">目标：在满足召回约束下，提供高吞吐 ANN 检索能力（CPU/GPU）。</span>
-        <span class="lang lang-en">Goal: deliver high-throughput ANN search on CPU/GPU under strict recall constraints.</span>
+        <span class="lang lang-zh">组合 FAISS、pgvector、PostgreSQL 全文检索、RRF 融合、离线评测和运行可观测性。</span>
+        <span class="lang lang-en">Combines FAISS, pgvector, PostgreSQL full-text search, RRF fusion, offline evaluation, and runtime observability.</span>
       </p>
       <div class="cta-row">
-        <a id="repo-link" class="btn" href="https://github.com" target="_blank" rel="noopener">
+        <a id="repo-link" class="btn" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
           <span class="lang lang-zh">GitHub 仓库</span>
           <span class="lang lang-en">GitHub Repository</span>
         </a>
-        <a class="btn ghost" href="#usage">
+        <a class="btn ghost" href="#docs">
           <span class="lang lang-zh">查看文档</span>
           <span class="lang lang-en">Read Docs</span>
         </a>
@@ -41,17 +42,31 @@
   <main class="container">
     <section id="purpose" class="card">
       <h2>
-        <span class="lang lang-zh">项目目的</span>
-        <span class="lang lang-en">Project Purpose</span>
+        <span class="lang lang-zh">项目内容</span>
+        <span class="lang lang-en">Project Scope</span>
       </h2>
-      <ul>
-        <li class="lang lang-zh">把 FAISS 检索能力集成到 PostgreSQL，提供函数式向量检索接口。</li>
-        <li class="lang lang-en">Integrate FAISS into PostgreSQL with function-oriented vector search APIs.</li>
-        <li class="lang lang-zh">以 `vector/vector[]` 作为主通道，降低数据转换开销。</li>
-        <li class="lang lang-en">Use `vector/vector[]` as the primary path to reduce conversion overhead.</li>
-        <li class="lang lang-zh">支持 `hnsw` / `ivfflat` / `ivfpq` 及 `l2` / `ip` / `cosine`。</li>
-        <li class="lang lang-en">Support `hnsw` / `ivfflat` / `ivfpq` with `l2` / `ip` / `cosine` metrics.</li>
-      </ul>
+      <div class="module-grid">
+        <div class="module">
+          <h3>FAISS in PostgreSQL</h3>
+          <p class="lang lang-zh">在 PostgreSQL backend 内运行 FAISS ANN 索引，支持 HNSW、IVFFlat、IVFPQ。</p>
+          <p class="lang lang-en">Runs FAISS ANN indexes inside a PostgreSQL backend with HNSW, IVFFlat, and IVFPQ.</p>
+        </div>
+        <div class="module">
+          <h3>RRF SQL</h3>
+          <p class="lang lang-zh">融合 pgvector 向量排名与 PostgreSQL <code>tsvector</code> 全文排名。</p>
+          <p class="lang lang-en">Fuses pgvector rankings with PostgreSQL <code>tsvector</code> full-text rankings.</p>
+        </div>
+        <div class="module">
+          <h3>Evaluation</h3>
+          <p class="lang lang-zh">离线计算 Recall@K、NDCG@K、P95/P99 latency，用于验证融合效果。</p>
+          <p class="lang lang-en">Computes Recall@K, NDCG@K, and P95/P99 latency to validate fusion quality.</p>
+        </div>
+        <div class="module">
+          <h3>Observability</h3>
+          <p class="lang lang-zh">暴露查询调用量、耗时、候选深度、batch 参数和自动调参状态。</p>
+          <p class="lang lang-en">Exposes call counts, timings, candidate depth, batch knobs, and autotune state.</p>
+        </div>
+      </div>
     </section>
 
     <section id="usage" class="card">
@@ -63,31 +78,71 @@
 CREATE EXTENSION pg_retrieval_engine;
 
 SELECT pg_retrieval_engine_index_create(
-  'docs_hnsw',
-  768,
-  'cosine',
-  'hnsw',
+  'docs_hnsw', 768, 'cosine', 'hnsw',
   '{"m":32,"ef_construction":200,"ef_search":64}'::jsonb,
   'cpu'
 );
 
 SELECT *
-FROM pg_retrieval_engine_index_search(
-  'docs_hnsw',
-  '[0.1,0.2,0.3,...]'::vector,
-  10,
-  '{"ef_search":128}'::jsonb
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{"vector_k":100,"fts_k":100,"rrf_k":60}'::jsonb
 );</code></pre>
+    </section>
+
+    <section id="metrics" class="card">
+      <h2>
+        <span class="lang lang-zh">量化指标</span>
+        <span class="lang lang-en">Quantitative Metrics</span>
+      </h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Module</th>
+              <th>Direction</th>
+              <th>Required metrics</th>
+              <th>Current target/result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>FAISS</td>
+              <td>ANN</td>
+              <td>Recall@10, avg latency, P95/P99, speedup</td>
+              <td>CPU target >= 5x; local HNSW 11.32x, IVFFlat 10.31x</td>
+            </tr>
+            <tr>
+              <td>RRF SQL</td>
+              <td>Hybrid fusion</td>
+              <td>Recall@K, NDCG@K, P95/P99</td>
+              <td>Report vector-only, FTS-only, and RRF together</td>
+            </tr>
+            <tr>
+              <td>Autotune</td>
+              <td>Runtime tuning</td>
+              <td>before/after Recall@K, NDCG@K, P95/P99</td>
+              <td>Validate with fixed qrels before accepting changes</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <section id="performance" class="card">
       <h2>
-        <span class="lang lang-zh">性能概览（CPU，批量查询路径）</span>
-        <span class="lang lang-en">Performance Snapshot (CPU, batch query path)</span>
+        <span class="lang lang-zh">性能样例（CPU，批量查询路径）</span>
+        <span class="lang lang-en">Performance Sample (CPU, batch query path)</span>
       </h2>
       <p>
-        <span class="lang lang-zh">实测环境（2026-04-14）：`20,000 x 128`，`29` queries，`k=10`。</span>
-        <span class="lang lang-en">Measured on 2026-04-14: `20,000 x 128`, `29` queries, `k=10`.</span>
+        <span class="lang lang-zh">实测环境（2026-04-14）：<code>20,000 x 128</code>，<code>29</code> queries，<code>k=10</code>。</span>
+        <span class="lang lang-en">Measured on 2026-04-14: <code>20,000 x 128</code>, <code>29</code> queries, <code>k=10</code>.</span>
       </p>
       <div class="table-wrap">
         <table>
@@ -95,10 +150,9 @@ FROM pg_retrieval_engine_index_search(
             <tr>
               <th>Scenario</th>
               <th>pgvector avg_ms</th>
-              <th>pg_retrieval_engine(batch) avg_ms</th>
+              <th>pg_retrieval_engine avg_ms</th>
               <th>Speedup</th>
-              <th>pgvector Recall@10</th>
-              <th>pg_retrieval_engine Recall@10</th>
+              <th>Recall@10</th>
             </tr>
           </thead>
           <tbody>
@@ -107,7 +161,6 @@ FROM pg_retrieval_engine_index_search(
               <td>1.13</td>
               <td>0.10</td>
               <td>11.32x</td>
-              <td>0.9552</td>
               <td>1.0000</td>
             </tr>
             <tr>
@@ -116,45 +169,60 @@ FROM pg_retrieval_engine_index_search(
               <td>0.07</td>
               <td>10.31x</td>
               <td>1.0000</td>
-              <td>1.0000</td>
             </tr>
           </tbody>
         </table>
       </div>
-      <p class="note">
-        <span class="lang lang-zh">重负载验收基准：`1M x 768`，详见 TAP 测试脚本。</span>
-        <span class="lang lang-en">Heavy acceptance benchmark: `1M x 768`; see TAP benchmark scripts.</span>
-      </p>
     </section>
 
-    <section class="card grid">
-      <a class="link-card" data-gh-path="contrib/pg_retrieval_engine/README.zh.md" href="https://github.com" target="_blank" rel="noopener">
+    <section id="docs" class="card grid">
+      <a class="link-card" data-gh-path="README.zh.md" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
         <h3>README (ZH)</h3>
-        <p class="lang lang-zh">安装、性能、示例总览</p>
-        <p class="lang lang-en">Install, performance, and usage overview</p>
+        <p class="lang lang-zh">项目总览、模块、安装与使用入口</p>
+        <p class="lang lang-en">Project overview, modules, install, and usage entry points</p>
       </a>
-      <a class="link-card" data-gh-path="contrib/pg_retrieval_engine/README.md" href="https://github.com" target="_blank" rel="noopener">
+      <a class="link-card" data-gh-path="README.md" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
         <h3>README (EN)</h3>
-        <p class="lang lang-zh">英文说明入口</p>
-        <p class="lang lang-en">English entry documentation</p>
+        <p class="lang lang-zh">英文项目总览</p>
+        <p class="lang lang-en">English project overview</p>
       </a>
-      <a class="link-card" data-gh-path="contrib/pg_retrieval_engine/docs/api.zh.md" href="https://github.com" target="_blank" rel="noopener">
+      <a class="link-card" data-gh-path="docs/architecture.zh.md" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
+        <h3>Architecture</h3>
+        <p class="lang lang-zh">模块边界与运行架构</p>
+        <p class="lang lang-en">Module boundaries and runtime architecture</p>
+      </a>
+      <a class="link-card" data-gh-path="docs/api.zh.md" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
         <h3>API</h3>
         <p class="lang lang-zh">每个接口的参数与语义</p>
         <p class="lang lang-en">Per-function parameter semantics</p>
       </a>
-      <a class="link-card" data-gh-path="contrib/pg_retrieval_engine/docs/design.zh.md" href="https://github.com" target="_blank" rel="noopener">
+      <a class="link-card" data-gh-path="docs/usage.zh.md" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
+        <h3>Usage</h3>
+        <p class="lang lang-zh">安装、建索引、查询与 RRF 示例</p>
+        <p class="lang lang-en">Install, indexing, search, and RRF examples</p>
+      </a>
+      <a class="link-card" data-gh-path="docs/benchmark.zh.md" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
+        <h3>Benchmark</h3>
+        <p class="lang lang-zh">模块量化测试与验收指标</p>
+        <p class="lang lang-en">Module-level quantitative tests and acceptance metrics</p>
+      </a>
+      <a class="link-card" data-gh-path="docs/design.zh.md" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
         <h3>Design</h3>
-        <p class="lang lang-zh">架构与性能方法学</p>
-        <p class="lang lang-en">Architecture and performance methodology</p>
+        <p class="lang lang-zh">按模块拆分的设计文档</p>
+        <p class="lang lang-en">Module-oriented design documents</p>
+      </a>
+      <a class="link-card" data-gh-path="docs/evaluation-protocol.zh.md" href="https://github.com/onelazyteam/pg_retrieval_engine" target="_blank" rel="noopener">
+        <h3>Evaluation</h3>
+        <p class="lang lang-zh">Recall@K、NDCG@K、P95/P99 评测协议</p>
+        <p class="lang lang-en">Recall@K, NDCG@K, and P95/P99 evaluation protocol</p>
       </a>
     </section>
   </main>
 
   <footer class="footer">
     <div class="container">
-      <span class="lang lang-zh">pg_retrieval_engine v0.2 · GitHub Pages</span>
-      <span class="lang lang-en">pg_retrieval_engine v0.2 · GitHub Pages</span>
+      <span class="lang lang-zh">pg_retrieval_engine v0.3 · GitHub Pages</span>
+      <span class="lang lang-en">pg_retrieval_engine v0.3 · GitHub Pages</span>
     </div>
   </footer>
 

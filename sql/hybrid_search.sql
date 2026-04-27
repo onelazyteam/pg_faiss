@@ -1,2 +1,16 @@
--- Draft scaffold: hybrid search SQL and RRF composition examples.
--- Not wired into extension install path yet.
+-- Hybrid search SQL and RRF composition examples.
+-- Runtime functions are installed by pg_retrieval_engine--0.3.0.sql.
+
+-- Example:
+--
+-- SELECT *
+-- FROM pg_retrieval_engine_hybrid_search(
+--   'documents'::regclass,
+--   'id',
+--   'embedding',
+--   'search_vector',
+--   '[0.1,0.2,0.3]'::vector,
+--   plainto_tsquery('english', 'vector database'),
+--   10,
+--   '{"vector_k":50,"fts_k":50,"rrf_k":60,"vector_operator":"<=>"}'::jsonb
+-- );

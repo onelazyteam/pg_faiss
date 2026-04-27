@@ -188,6 +188,53 @@ FROM pg_retrieval_engine_index_search('idx_ivf', '[1,0,0,0]'::vector, 1, '{"npro
  11
 (1 row)
 
+SELECT id, vector_rank, fts_rank, round(rrf_score::numeric, 6) AS rrf_score
+FROM pg_retrieval_engine_rrf_fuse(
+    ARRAY[1,2,3]::bigint[],
+    ARRAY[3,2,4]::bigint[],
+    4
+);
+ id | vector_rank | fts_rank | rrf_score 
+----+-------------+----------+-----------
+  3 |           3 |        1 |  0.032266
+  2 |           2 |        2 |  0.032258
+  1 |           1 |          |  0.016393
+  4 |             |        3 |  0.015873
+(4 rows)
+
+CREATE TABLE rrf_docs (
+    id bigint PRIMARY KEY,
+    embedding vector(4),
+    search_vector tsvector
+);
+INSERT INTO rrf_docs VALUES
+    (1, '[1,0,0,0]'::vector, to_tsvector('simple', 'apple database vector')),
+    (2, '[0.9,0.1,0,0]'::vector, to_tsvector('simple', 'apple search ranking')),
+    (3, '[0,1,0,0]'::vector, to_tsvector('simple', 'banana text search')),
+    (4, '[0,0,1,0]'::vector, to_tsvector('simple', 'apple apple full text'));
+SELECT id,
+       vector_rank,
+       fts_rank,
+       vector_distance IS NOT NULL AS has_vector,
+       fts_score IS NOT NULL AS has_fts
+FROM pg_retrieval_engine_hybrid_search(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":2,"fts_k":2,"rrf_k":60,"rank_function":"ts_rank","normalization":0}'::jsonb
+);
+ id | vector_rank | fts_rank | has_vector | has_fts 
+----+-------------+----------+------------+---------
+  1 |           1 |        2 | t          | t
+  4 |             |        1 | f          | t
+  2 |           2 |          | t          | f
+(3 rows)
+
+DROP TABLE rrf_docs;
 SELECT pg_retrieval_engine_index_drop('idx_h') IS NOT NULL AS drop_loaded_ok;
  drop_loaded_ok 
 ----------------

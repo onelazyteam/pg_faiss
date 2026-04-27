@@ -1,0 +1,2 @@
+{"qid":"example-1","method":"vector","latency_ms":3.1,"results":[{"id":"doc-2"},{"id":"doc-1"}]}
+{"qid":"example-1","method":"rrf","latency_ms":4.2,"results":[{"id":"doc-1"},{"id":"doc-2"}]}

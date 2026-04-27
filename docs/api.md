@@ -1,4 +1,4 @@
-# pg_retrieval_engine v0.2 API Reference (Detailed)
+# pg_retrieval_engine v0.3 API Reference (Detailed)
 
 ## 1. Global Notes
 
@@ -18,6 +18,8 @@
 | `pg_retrieval_engine_index_search_batch` | `table(query_no, id, distance)` | Batch ANN (optimized path) |
 | `pg_retrieval_engine_index_search_filtered` | `table(id, distance)` | Hybrid retrieval (single query, ID filter) |
 | `pg_retrieval_engine_index_search_batch_filtered` | `table(query_no, id, distance)` | Hybrid retrieval (batch query, ID filter) |
+| `pg_retrieval_engine_rrf_fuse` | `table(id, rrf_score, vector_rank, fts_rank)` | Fuse two ranked ID lists |
+| `pg_retrieval_engine_hybrid_search` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | pgvector + `tsvector` RRF hybrid search |
 | `pg_retrieval_engine_index_autotune` | `jsonb` | Auto tune defaults |
 | `pg_retrieval_engine_metrics_reset` | `void` | Reset runtime counters |
 | `pg_retrieval_engine_index_save` | `void` | Persist index |
@@ -141,7 +143,62 @@ pg_retrieval_engine_index_search_batch_filtered(
 
 Batch hybrid retrieval with per-query top-k after filtering.
 
-### 3.8 `pg_retrieval_engine_index_autotune`
+### 3.8 `pg_retrieval_engine_rrf_fuse`
+
+```sql
+pg_retrieval_engine_rrf_fuse(
+  vector_ids bigint[],
+  fts_ids bigint[],
+  k int,
+  rrf_k double precision default 60.0,
+  vector_weight double precision default 1.0,
+  fts_weight double precision default 1.0
+) returns table(id bigint, rrf_score double precision, vector_rank int, fts_rank int)
+```
+
+Fuses two relevance-ordered ID lists with Reciprocal Rank Fusion. Ranks are 1-based; missing ranks contribute 0.
+
+```text
+score = vector_weight / (rrf_k + vector_rank)
+      + fts_weight    / (rrf_k + fts_rank)
+```
+
+### 3.9 `pg_retrieval_engine_hybrid_search`
+
+```sql
+pg_retrieval_engine_hybrid_search(
+  table_name regclass,
+  id_column name,
+  vector_column name,
+  tsvector_column name,
+  query_vector vector,
+  query_tsquery tsquery,
+  k int,
+  options jsonb default '{}'::jsonb
+) returns table(
+  id bigint,
+  rrf_score double precision,
+  vector_rank int,
+  fts_rank int,
+  vector_distance real,
+  fts_score real
+)
+```
+
+Runs pgvector distance ranking and PostgreSQL `tsvector` full-text ranking on one table, then returns unified top-k results with RRF.
+
+Supported `options`:
+
+- `vector_k` / `dense_k`: vector candidate depth, default `k * 4`
+- `fts_k` / `sparse_k`: full-text candidate depth, default `k * 4`
+- `rrf_k`: RRF smoothing constant, default `60`
+- `vector_weight` / `dense_weight`: vector result weight, default `1`
+- `fts_weight` / `sparse_weight`: full-text result weight, default `1`
+- `vector_operator`: `<=>` (default, cosine distance) / `<->` (L2) / `<#>` (negative inner product)
+- `rank_function`: `ts_rank_cd` (default) / `ts_rank`
+- `normalization`: full-text rank normalization, default `32`
+
+### 3.10 `pg_retrieval_engine_index_autotune`
 
 ```sql
 pg_retrieval_engine_index_autotune(
@@ -161,7 +218,7 @@ Arguments:
 
 Returns JSON old/new diffs for `hnsw_ef_search`, `ivf_nprobe`, and `preferred_batch_size`.
 
-### 3.9 `pg_retrieval_engine_metrics_reset`
+### 3.11 `pg_retrieval_engine_metrics_reset`
 
 ```sql
 pg_retrieval_engine_metrics_reset(name text default null) returns void
@@ -170,7 +227,7 @@ pg_retrieval_engine_metrics_reset(name text default null) returns void
 - `name is null`: reset runtime counters for all indexes in current backend.
 - `name is not null`: reset only the target index.
 
-### 3.10 `pg_retrieval_engine_index_save`
+### 3.12 `pg_retrieval_engine_index_save`
 
 ```sql
 pg_retrieval_engine_index_save(name text, path text) returns void
@@ -179,7 +236,7 @@ pg_retrieval_engine_index_save(name text, path text) returns void
 - Main index file: `path`
 - Sidecar metadata: `path.meta`
 
-### 3.11 `pg_retrieval_engine_index_load`
+### 3.13 `pg_retrieval_engine_index_load`
 
 ```sql
 pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') returns void
@@ -187,7 +244,7 @@ pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') 
 
 Loads a persisted index under a new runtime name.
 
-### 3.12 `pg_retrieval_engine_index_stats`
+### 3.14 `pg_retrieval_engine_index_stats`
 
 ```sql
 pg_retrieval_engine_index_stats(name text) returns jsonb
@@ -199,16 +256,32 @@ Returns:
 - Config snapshots: `hnsw/ivf/ivfpq`
 - Runtime metrics: `runtime.*` (call counts, timing totals/averages, latest candidate/batch knobs, autotune state)
 
-### 3.13 `pg_retrieval_engine_index_drop`
+### 3.15 `pg_retrieval_engine_index_drop`
 
 ```sql
 pg_retrieval_engine_index_drop(name text) returns void
 ```
 
-### 3.14 `pg_retrieval_engine_reset`
+### 3.16 `pg_retrieval_engine_reset`
 
 ```sql
 pg_retrieval_engine_reset() returns void
+```
+
+### RRF fusion
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{"vector_k":100,"fts_k":100,"rrf_k":60,"vector_operator":"<=>"}'::jsonb
+);
 ```
 
 ## 4. Common Errors
