@@ -6,6 +6,12 @@ MODULE_big = pg_retrieval_engine
 OBJS = src/faiss_in_pg/faiss_engine.o
 HEADERS = src/faiss_in_pg/faiss_engine.hpp
 
+# PostgreSQL PGXS may try to build LLVM bitcode when the server was built with
+# LLVM. This C++17 extension includes PostgreSQL server headers and FAISS/OpenMP
+# headers, which are not reliably compatible with PGXS bitcode compilation on
+# older PostgreSQL toolchains.
+override with_llvm = no
+
 DATA = $(wildcard sql/*--*.sql)
 
 TESTS = $(wildcard test/sql/*.sql)

@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, master]
     paths:
-      - 'contrib/pg_retrieval_engine/site/**'
+      - 'site/**'
       - '.github/workflows/pg_retrieval_engine-pages.yml'
   workflow_dispatch:
 
@@ -30,7 +30,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: contrib/pg_retrieval_engine/site
+          path: site
 
   deploy:
     needs: build

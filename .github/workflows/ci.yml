@@ -13,6 +13,7 @@ jobs:
     env:
       LANG: C.UTF-8
       LC_ALL: C.UTF-8
+      PG_TEST_PORT: 55432
 
     steps:
       - name: Checkout
@@ -26,7 +27,8 @@ jobs:
             ca-certificates \
             cmake \
             git \
-            libfaiss-dev \
+            libopenblas-dev \
+            libomp-dev \
             libpq-dev \
             pkg-config
 
@@ -77,24 +79,61 @@ jobs:
           make -C /tmp/pgvector PG_CONFIG="$(which pg_config)"
           sudo make -C /tmp/pgvector PG_CONFIG="$(which pg_config)" install
 
+      - name: Build and install FAISS CPU (v1.14.1)
+        run: |
+          git clone --depth 1 --branch v1.14.1 https://github.com/facebookresearch/faiss.git /tmp/faiss
+          cmake -S /tmp/faiss -B /tmp/faiss/build \
+            -DFAISS_ENABLE_GPU=OFF \
+            -DFAISS_ENABLE_PYTHON=OFF \
+            -DFAISS_ENABLE_C_API=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/tmp/faiss-install \
+            -DBLA_VENDOR=OpenBLAS
+          cmake --build /tmp/faiss/build --target faiss -j"$(nproc)"
+          cmake --install /tmp/faiss/build
+          test -f /tmp/faiss-install/include/faiss/IndexIDMap.h
+
       - name: Build and install pg_retrieval_engine (CPU)
         working-directory: .
         run: |
-          FAISS_CFLAGS="$(pkg-config --cflags faiss 2>/dev/null || true)"
-          FAISS_LIBS="$(pkg-config --libs faiss 2>/dev/null || echo '-lfaiss')"
+          FAISS_CFLAGS="-I/tmp/faiss-install/include"
+          FAISS_LIBS="-L/tmp/faiss-install/lib -lfaiss -lopenblas -lgomp"
           echo "FAISS_CFLAGS=$FAISS_CFLAGS"
           echo "FAISS_LIBS=$FAISS_LIBS"
           make \
             PG_CONFIG="$(which pg_config)" \
+            with_llvm=no \
             PG_CPPFLAGS="$FAISS_CFLAGS -std=c++17" \
             SHLIB_LINK="$FAISS_LIBS"
           sudo make \
             PG_CONFIG="$(which pg_config)" \
+            with_llvm=no \
             PG_CPPFLAGS="$FAISS_CFLAGS -std=c++17" \
             SHLIB_LINK="$FAISS_LIBS" \
             install
 
+      - name: Start temporary PostgreSQL server
+        run: |
+          export PATH="$(pg_config --bindir):$PATH"
+          export LD_LIBRARY_PATH="/tmp/faiss-install/lib:${LD_LIBRARY_PATH:-}"
+          initdb -D /tmp/pg_retrieval_engine_pgdata --no-locale --encoding=UTF8
+          pg_ctl -D /tmp/pg_retrieval_engine_pgdata \
+            -o "-p ${PG_TEST_PORT} -k /tmp" \
+            -l /tmp/pg_retrieval_engine_postgres.log \
+            start
+          pg_isready -h /tmp -p "${PG_TEST_PORT}" -d postgres
+
       - name: Run basic regression test
         working-directory: .
         run: |
-          make PG_CONFIG="$(which pg_config)" installcheck
+          export LD_LIBRARY_PATH="/tmp/faiss-install/lib:${LD_LIBRARY_PATH:-}"
+          export PGHOST=/tmp
+          export PGPORT="${PG_TEST_PORT}"
+          make \
+            PG_CONFIG="$(which pg_config)" \
+            with_llvm=no \
+            TAP_TESTS= \
+            PG_CPPFLAGS="-I/tmp/faiss-install/include -std=c++17" \
+            SHLIB_LINK="-L/tmp/faiss-install/lib -lfaiss -lopenblas -lgomp" \
+            installcheck
