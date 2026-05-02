@@ -1,2 +1,6 @@
--- Draft scaffold: logical schema for hybrid retrieval experiments.
--- Not wired into extension install path yet.
+-- Installed logical schema summary.
+-- Runtime objects are defined in pg_retrieval_engine--1.0.0.sql:
+-- - pg_retrieval_engine_documents
+-- - pg_retrieval_engine_chunks
+-- - pg_retrieval_engine_embedding_versions
+-- - pg_retrieval_engine_embedding_jobs
