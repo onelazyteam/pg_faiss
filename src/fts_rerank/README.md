@@ -1,7 +1,12 @@
-# fts_rerank (Planned)
+# fts_rerank
 
-Status: scaffold only. No runtime implementation yet.
+Status: implemented as SQL rerank v1.
 
-Planned scope:
-- PostgreSQL full-text retrieval acceleration path
-- BM25/sparse rerank scoring hooks
+Implemented scope:
+- `pg_retrieval_engine_rerank`: rerank an existing candidate ID list with externally supplied scores.
+- Supported score channels: cross-encoder, LLM, rule-based, and base scores.
+- Supported score normalization: `none` and `minmax`.
+
+Execution boundary:
+- Cross-encoder and LLM inference runs outside PostgreSQL.
+- PostgreSQL receives score arrays and performs deterministic weighting, tie-breaking, and diagnostics.

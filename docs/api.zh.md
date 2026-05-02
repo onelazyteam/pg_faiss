@@ -18,8 +18,19 @@
 | `pg_retrieval_engine_index_search_batch` | `table(query_no, id, distance)` | 批量检索（优化路径） |
 | `pg_retrieval_engine_index_search_filtered` | `table(id, distance)` | 混合检索（单查，ID 过滤） |
 | `pg_retrieval_engine_index_search_batch_filtered` | `table(query_no, id, distance)` | 混合检索（批查，ID 过滤） |
+| `pg_retrieval_engine_document_upsert` | `bigint` | 登记或更新已抽取的多源文档文本 |
+| `pg_retrieval_engine_chunk_document` | `table(...)` | 结构化 chunk、parent-child chunk、metadata/citation metadata |
+| `pg_retrieval_engine_embedding_version_create` | `bigint` | 创建或更新 embedding 版本 |
+| `pg_retrieval_engine_enqueue_embedding_jobs` | `integer` | 按 chunk content hash 生成增量向量化任务 |
+| `pg_retrieval_engine_embedding_job_complete` | `void` | 写回外部 worker 生成的 embedding |
+| `pg_retrieval_engine_pgvector_index_create` | `text` | 创建 pgvector HNSW / IVFFlat 索引 |
+| `pg_retrieval_engine_tsvector_index_create` | `text` | 创建 `tsvector` GIN 索引 |
 | `pg_retrieval_engine_rrf_fuse` | `table(id, rrf_score, vector_rank, fts_rank)` | 融合两个已排序 ID 列表 |
 | `pg_retrieval_engine_hybrid_search` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | pgvector + `tsvector` RRF 混合检索 |
+| `pg_retrieval_engine_hybrid_search_faiss` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | FAISS + `tsvector` RRF 混合检索 |
+| `pg_retrieval_engine_rerank` | `table(id, final_score, base_rank, base_score, cross_encoder_score, llm_score, rule_score, diagnostics)` | 基于外部模型/规则分数的候选精排 |
+| `pg_retrieval_engine_rerank_with_citations` | `table(..., citation, diagnostics)` | 精排并按候选顺序附加 citation metadata |
+| `pg_retrieval_engine_retrieval_explain` | `jsonb` | 输出召回阶段计数和 likely failure reason |
 | `pg_retrieval_engine_index_autotune` | `jsonb` | 自动调参 |
 | `pg_retrieval_engine_metrics_reset` | `void` | 重置 runtime 指标 |
 | `pg_retrieval_engine_index_save` | `void` | 保存索引 |
@@ -143,7 +154,47 @@ pg_retrieval_engine_index_search_batch_filtered(
 
 作用：批量混合检索。每个 query 在过滤后返回 top-k。
 
-### 3.8 `pg_retrieval_engine_rrf_fuse`
+### 3.8 数据导入、Chunk 与 Embedding 队列
+
+```sql
+pg_retrieval_engine_document_upsert(
+  source_uri text,
+  source_type text,
+  content text,
+  metadata jsonb default '{}'::jsonb,
+  title text default null
+) returns bigint
+```
+
+登记或更新外部 parser 已抽取的文本。`source_type` 支持 `technical_doc` / `log` / `sql` / `markdown` / `pdf` / `html` / `text`。PDF/HTML 二进制解析不在 PostgreSQL backend 内执行。
+
+```sql
+pg_retrieval_engine_chunk_document(
+  document_id bigint,
+  chunk_size int default 1000,
+  chunk_overlap int default 100,
+  options jsonb default '{}'::jsonb
+) returns table(chunk_id bigint, parent_chunk_id bigint, chunk_no int, chunk_type text, content text, citation_metadata jsonb)
+```
+
+按字符窗口生成 child chunks；`options.parent_chunk_size` 大于 0 时同时生成 parent chunks。每个 chunk 记录 `metadata`、`citation_metadata`、`search_vector` 和 content hash。
+
+```sql
+pg_retrieval_engine_embedding_version_create(model_name text, model_version text, dimensions int, distance_metric text default 'cosine', metadata jsonb default '{}'::jsonb, is_active boolean default true) returns bigint
+pg_retrieval_engine_enqueue_embedding_jobs(embedding_version_id bigint, only_changed boolean default true) returns integer
+pg_retrieval_engine_embedding_job_complete(job_id bigint, embedding vector, metadata jsonb default '{}'::jsonb) returns void
+```
+
+Embedding worker 在 PostgreSQL 外部运行；扩展负责版本记录、增量任务队列和 embedding 写回。
+
+```sql
+pg_retrieval_engine_pgvector_index_create(table_name regclass, vector_column name, index_type text, opclass text default 'vector_cosine_ops', options jsonb default '{}'::jsonb) returns text
+pg_retrieval_engine_tsvector_index_create(table_name regclass, tsvector_column name) returns text
+```
+
+创建 pgvector HNSW / IVFFlat 索引和 `tsvector` GIN 索引。
+
+### 3.9 `pg_retrieval_engine_rrf_fuse`
 
 ```sql
 pg_retrieval_engine_rrf_fuse(
@@ -165,7 +216,7 @@ score = vector_weight / (rrf_k + vector_rank)
       + fts_weight    / (rrf_k + fts_rank)
 ```
 
-### 3.9 `pg_retrieval_engine_hybrid_search`
+### 3.10 `pg_retrieval_engine_hybrid_search`
 
 ```sql
 pg_retrieval_engine_hybrid_search(
@@ -200,7 +251,86 @@ pg_retrieval_engine_hybrid_search(
 - `rank_function`：`ts_rank_cd`（默认）/ `ts_rank`
 - `normalization`：全文 rank normalization，默认 `32`
 
-### 3.10 `pg_retrieval_engine_index_autotune`
+### 3.11 `pg_retrieval_engine_hybrid_search_faiss`
+
+```sql
+pg_retrieval_engine_hybrid_search_faiss(
+  table_name regclass,
+  id_column name,
+  tsvector_column name,
+  faiss_index_name text,
+  query_vector vector,
+  query_tsquery tsquery,
+  k int,
+  options jsonb default '{}'::jsonb
+) returns table(id bigint, rrf_score double precision, vector_rank int, fts_rank int, vector_distance real, fts_score real)
+```
+
+使用 FAISS 索引执行 dense 召回，同时使用 PostgreSQL `tsvector` 执行 sparse 召回，然后在 SQL 内执行 RRF。
+
+### 3.12 `pg_retrieval_engine_rerank`
+
+```sql
+pg_retrieval_engine_rerank(
+  candidate_ids bigint[],
+  k int,
+  cross_encoder_scores double precision[] default null,
+  llm_scores double precision[] default null,
+  rule_scores double precision[] default null,
+  base_scores double precision[] default null,
+  options jsonb default '{}'::jsonb
+) returns table(
+  id bigint,
+  final_score double precision,
+  base_rank int,
+  base_score double precision,
+  cross_encoder_score double precision,
+  llm_score double precision,
+  rule_score double precision,
+  diagnostics jsonb
+)
+```
+
+作用：对已有候选 ID 列表执行精排。cross-encoder 和 LLM 推理由 PostgreSQL 外部的应用或离线服务完成，本函数只接收分数并执行确定性的加权排序。
+
+默认公式：
+
+```text
+final_score =
+  base_weight * base_component +
+  cross_encoder_weight * cross_encoder_score +
+  llm_weight * llm_score +
+  rule_weight * rule_score
+```
+
+如果未传 `base_scores`，`base_component` 使用 `1 / (rank_k + base_rank)`。重复候选 ID 保留第一次出现的位置和对应分数。
+
+`options` 字段：
+
+- `base_weight`：基础 rank/base score 权重，默认 `1`
+- `cross_encoder_weight`：cross-encoder 分数权重，默认 `1`
+- `llm_weight`：LLM 分数权重，默认 `1`
+- `rule_weight`：规则分数权重，默认 `1`
+- `rank_k`：基础 rank prior 平滑常数，默认 `60`
+- `score_normalization`：`none`（默认）/ `minmax`
+
+`pg_retrieval_engine_rerank_with_citations(...)` 与 `pg_retrieval_engine_rerank(...)` 使用同一打分参数，并额外接收 `citation_metadata jsonb[]`，按输入候选顺序把 citation 附加到精排结果。
+
+### 3.13 `pg_retrieval_engine_retrieval_explain`
+
+```sql
+pg_retrieval_engine_retrieval_explain(
+  vector_ids bigint[] default ARRAY[]::bigint[],
+  fts_ids bigint[] default ARRAY[]::bigint[],
+  final_ids bigint[] default ARRAY[]::bigint[],
+  relevant_ids bigint[] default null,
+  options jsonb default '{}'::jsonb
+) returns jsonb
+```
+
+返回 `stage_counts`、`relevance.recalled`、`relevance.missing` 和 `likely_failure_reason`。v1 reason 包含 `no_final_results`、`no_relevance_labels`、`fully_recalled`、`fusion_or_rerank_drop`、`candidate_generation_miss`。
+
+### 3.14 `pg_retrieval_engine_index_autotune`
 
 ```sql
 pg_retrieval_engine_index_autotune(
@@ -220,7 +350,7 @@ pg_retrieval_engine_index_autotune(
 
 返回：包含 `hnsw_ef_search` / `ivf_nprobe` / `preferred_batch_size` 的 old/new 对比。
 
-### 3.11 `pg_retrieval_engine_metrics_reset`
+### 3.15 `pg_retrieval_engine_metrics_reset`
 
 ```sql
 pg_retrieval_engine_metrics_reset(name text default null) returns void
@@ -229,7 +359,7 @@ pg_retrieval_engine_metrics_reset(name text default null) returns void
 - `name is null`：重置当前 backend 全部索引 runtime 指标。
 - `name not null`：只重置目标索引 runtime 指标。
 
-### 3.12 `pg_retrieval_engine_index_save`
+### 3.16 `pg_retrieval_engine_index_save`
 
 ```sql
 pg_retrieval_engine_index_save(name text, path text) returns void
@@ -238,7 +368,7 @@ pg_retrieval_engine_index_save(name text, path text) returns void
 - 主索引写到 `path`
 - 元数据写到 `path.meta`
 
-### 3.13 `pg_retrieval_engine_index_load`
+### 3.17 `pg_retrieval_engine_index_load`
 
 ```sql
 pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') returns void
@@ -246,7 +376,7 @@ pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') 
 
 - 将磁盘索引加载为新索引名。
 
-### 3.14 `pg_retrieval_engine_index_stats`
+### 3.18 `pg_retrieval_engine_index_stats`
 
 ```sql
 pg_retrieval_engine_index_stats(name text) returns jsonb
@@ -258,13 +388,13 @@ pg_retrieval_engine_index_stats(name text) returns jsonb
 - 参数：`hnsw/ivf/ivfpq`
 - 运行指标：`runtime.*`（调用量、耗时、候选深度、batch 参数、autotune 状态等）
 
-### 3.15 `pg_retrieval_engine_index_drop`
+### 3.19 `pg_retrieval_engine_index_drop`
 
 ```sql
 pg_retrieval_engine_index_drop(name text) returns void
 ```
 
-### 3.16 `pg_retrieval_engine_reset`
+### 3.20 `pg_retrieval_engine_reset`
 
 ```sql
 pg_retrieval_engine_reset() returns void

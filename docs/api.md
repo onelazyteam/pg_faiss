@@ -18,8 +18,19 @@
 | `pg_retrieval_engine_index_search_batch` | `table(query_no, id, distance)` | Batch ANN (optimized path) |
 | `pg_retrieval_engine_index_search_filtered` | `table(id, distance)` | Hybrid retrieval (single query, ID filter) |
 | `pg_retrieval_engine_index_search_batch_filtered` | `table(query_no, id, distance)` | Hybrid retrieval (batch query, ID filter) |
+| `pg_retrieval_engine_document_upsert` | `bigint` | Register/update extracted multi-source document text |
+| `pg_retrieval_engine_chunk_document` | `table(...)` | Structured chunks, parent-child chunks, metadata/citation metadata |
+| `pg_retrieval_engine_embedding_version_create` | `bigint` | Create/update an embedding version |
+| `pg_retrieval_engine_enqueue_embedding_jobs` | `integer` | Queue changed chunks by content hash |
+| `pg_retrieval_engine_embedding_job_complete` | `void` | Persist embeddings produced by an external worker |
+| `pg_retrieval_engine_pgvector_index_create` | `text` | Create pgvector HNSW / IVFFlat indexes |
+| `pg_retrieval_engine_tsvector_index_create` | `text` | Create `tsvector` GIN indexes |
 | `pg_retrieval_engine_rrf_fuse` | `table(id, rrf_score, vector_rank, fts_rank)` | Fuse two ranked ID lists |
 | `pg_retrieval_engine_hybrid_search` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | pgvector + `tsvector` RRF hybrid search |
+| `pg_retrieval_engine_hybrid_search_faiss` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | FAISS + `tsvector` RRF hybrid search |
+| `pg_retrieval_engine_rerank` | `table(id, final_score, base_rank, base_score, cross_encoder_score, llm_score, rule_score, diagnostics)` | Rerank candidates with external model/rule scores |
+| `pg_retrieval_engine_rerank_with_citations` | `table(..., citation, diagnostics)` | Rerank candidates with citation metadata |
+| `pg_retrieval_engine_retrieval_explain` | `jsonb` | Report stage counts and likely failure reason |
 | `pg_retrieval_engine_index_autotune` | `jsonb` | Auto tune defaults |
 | `pg_retrieval_engine_metrics_reset` | `void` | Reset runtime counters |
 | `pg_retrieval_engine_index_save` | `void` | Persist index |
@@ -143,7 +154,26 @@ pg_retrieval_engine_index_search_batch_filtered(
 
 Batch hybrid retrieval with per-query top-k after filtering.
 
-### 3.8 `pg_retrieval_engine_rrf_fuse`
+### 3.8 Ingest, Chunking, and Embedding Queue
+
+```sql
+pg_retrieval_engine_document_upsert(source_uri text, source_type text, content text, metadata jsonb default '{}'::jsonb, title text default null) returns bigint
+pg_retrieval_engine_chunk_document(document_id bigint, chunk_size int default 1000, chunk_overlap int default 100, options jsonb default '{}'::jsonb) returns table(...)
+pg_retrieval_engine_embedding_version_create(model_name text, model_version text, dimensions int, distance_metric text default 'cosine', metadata jsonb default '{}'::jsonb, is_active boolean default true) returns bigint
+pg_retrieval_engine_enqueue_embedding_jobs(embedding_version_id bigint, only_changed boolean default true) returns integer
+pg_retrieval_engine_embedding_job_complete(job_id bigint, embedding vector, metadata jsonb default '{}'::jsonb) returns void
+```
+
+The extension stores extracted text, structured chunks, parent-child links, metadata, citation metadata, embedding versions, and incremental embedding jobs. Binary PDF/HTML parsing and embedding model execution stay outside PostgreSQL.
+
+```sql
+pg_retrieval_engine_pgvector_index_create(table_name regclass, vector_column name, index_type text, opclass text default 'vector_cosine_ops', options jsonb default '{}'::jsonb) returns text
+pg_retrieval_engine_tsvector_index_create(table_name regclass, tsvector_column name) returns text
+```
+
+Creates pgvector HNSW / IVFFlat indexes and `tsvector` GIN indexes.
+
+### 3.9 `pg_retrieval_engine_rrf_fuse`
 
 ```sql
 pg_retrieval_engine_rrf_fuse(
@@ -163,7 +193,7 @@ score = vector_weight / (rrf_k + vector_rank)
       + fts_weight    / (rrf_k + fts_rank)
 ```
 
-### 3.9 `pg_retrieval_engine_hybrid_search`
+### 3.10 `pg_retrieval_engine_hybrid_search`
 
 ```sql
 pg_retrieval_engine_hybrid_search(
@@ -198,7 +228,86 @@ Supported `options`:
 - `rank_function`: `ts_rank_cd` (default) / `ts_rank`
 - `normalization`: full-text rank normalization, default `32`
 
-### 3.10 `pg_retrieval_engine_index_autotune`
+### 3.11 `pg_retrieval_engine_hybrid_search_faiss`
+
+```sql
+pg_retrieval_engine_hybrid_search_faiss(
+  table_name regclass,
+  id_column name,
+  tsvector_column name,
+  faiss_index_name text,
+  query_vector vector,
+  query_tsquery tsquery,
+  k int,
+  options jsonb default '{}'::jsonb
+) returns table(id bigint, rrf_score double precision, vector_rank int, fts_rank int, vector_distance real, fts_score real)
+```
+
+Runs FAISS dense retrieval and PostgreSQL `tsvector` sparse retrieval, then fuses both paths with RRF inside PostgreSQL.
+
+### 3.12 `pg_retrieval_engine_rerank`
+
+```sql
+pg_retrieval_engine_rerank(
+  candidate_ids bigint[],
+  k int,
+  cross_encoder_scores double precision[] default null,
+  llm_scores double precision[] default null,
+  rule_scores double precision[] default null,
+  base_scores double precision[] default null,
+  options jsonb default '{}'::jsonb
+) returns table(
+  id bigint,
+  final_score double precision,
+  base_rank int,
+  base_score double precision,
+  cross_encoder_score double precision,
+  llm_score double precision,
+  rule_score double precision,
+  diagnostics jsonb
+)
+```
+
+Reranks an existing candidate list. Cross-encoder and LLM inference is done outside PostgreSQL; this function receives their scores and performs deterministic weighted sorting.
+
+Default formula:
+
+```text
+final_score =
+  base_weight * base_component +
+  cross_encoder_weight * cross_encoder_score +
+  llm_weight * llm_score +
+  rule_weight * rule_score
+```
+
+If `base_scores` is omitted, `base_component` is `1 / (rank_k + base_rank)`. Duplicate candidate IDs keep the first occurrence and matching scores.
+
+Supported `options`:
+
+- `base_weight`: base rank/base score weight, default `1`
+- `cross_encoder_weight`: cross-encoder score weight, default `1`
+- `llm_weight`: LLM score weight, default `1`
+- `rule_weight`: rule-based score weight, default `1`
+- `rank_k`: base rank prior smoothing constant, default `60`
+- `score_normalization`: `none` (default) / `minmax`
+
+`pg_retrieval_engine_rerank_with_citations(...)` accepts the same scoring arguments plus `citation_metadata jsonb[]`, then attaches citation metadata aligned with the input candidate order.
+
+### 3.13 `pg_retrieval_engine_retrieval_explain`
+
+```sql
+pg_retrieval_engine_retrieval_explain(
+  vector_ids bigint[] default ARRAY[]::bigint[],
+  fts_ids bigint[] default ARRAY[]::bigint[],
+  final_ids bigint[] default ARRAY[]::bigint[],
+  relevant_ids bigint[] default null,
+  options jsonb default '{}'::jsonb
+) returns jsonb
+```
+
+Returns stage counts, recalled/missing relevant IDs, and `likely_failure_reason`.
+
+### 3.14 `pg_retrieval_engine_index_autotune`
 
 ```sql
 pg_retrieval_engine_index_autotune(
@@ -218,7 +327,7 @@ Arguments:
 
 Returns JSON old/new diffs for `hnsw_ef_search`, `ivf_nprobe`, and `preferred_batch_size`.
 
-### 3.11 `pg_retrieval_engine_metrics_reset`
+### 3.15 `pg_retrieval_engine_metrics_reset`
 
 ```sql
 pg_retrieval_engine_metrics_reset(name text default null) returns void
@@ -227,7 +336,7 @@ pg_retrieval_engine_metrics_reset(name text default null) returns void
 - `name is null`: reset runtime counters for all indexes in current backend.
 - `name is not null`: reset only the target index.
 
-### 3.12 `pg_retrieval_engine_index_save`
+### 3.16 `pg_retrieval_engine_index_save`
 
 ```sql
 pg_retrieval_engine_index_save(name text, path text) returns void
@@ -236,7 +345,7 @@ pg_retrieval_engine_index_save(name text, path text) returns void
 - Main index file: `path`
 - Sidecar metadata: `path.meta`
 
-### 3.13 `pg_retrieval_engine_index_load`
+### 3.17 `pg_retrieval_engine_index_load`
 
 ```sql
 pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') returns void
@@ -244,7 +353,7 @@ pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') 
 
 Loads a persisted index under a new runtime name.
 
-### 3.14 `pg_retrieval_engine_index_stats`
+### 3.18 `pg_retrieval_engine_index_stats`
 
 ```sql
 pg_retrieval_engine_index_stats(name text) returns jsonb
@@ -256,13 +365,13 @@ Returns:
 - Config snapshots: `hnsw/ivf/ivfpq`
 - Runtime metrics: `runtime.*` (call counts, timing totals/averages, latest candidate/batch knobs, autotune state)
 
-### 3.15 `pg_retrieval_engine_index_drop`
+### 3.19 `pg_retrieval_engine_index_drop`
 
 ```sql
 pg_retrieval_engine_index_drop(name text) returns void
 ```
 
-### 3.16 `pg_retrieval_engine_reset`
+### 3.20 `pg_retrieval_engine_reset`
 
 ```sql
 pg_retrieval_engine_reset() returns void

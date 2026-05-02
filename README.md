@@ -14,12 +14,17 @@ English | [中文](README.zh.md)
 | Vector retrieval API | implemented | Supports `hnsw`, `ivfflat`, `ivfpq`; metrics: `l2`, `ip`, `cosine` |
 | Batch search optimization | implemented | Uses `batch_size` chunking to bound memory for large query batches |
 | Filtered retrieval | implemented | Filters ANN candidates by a `filter_ids` allow-list |
+| Document ingest and chunking | implemented v1 | Registers multi-source extracted text, structured chunks, parent-child chunks, metadata/citation metadata |
+| Embedding versions and incremental queue | implemented v1 | Tracks embedding model versions and queues changed chunks by content hash |
+| pgvector index management | implemented v1 | Creates `pgvector` HNSW / IVFFlat indexes |
 | RRF fusion | implemented | Fuses pgvector rankings with PostgreSQL `tsvector` full-text rankings |
+| FAISS + FTS retrieval | implemented v1 | Runs FAISS dense and `tsvector` sparse retrieval before RRF |
 | Observability | implemented | Exposes runtime counters, timings, and latest query knobs |
 | Autotune | implemented | Updates defaults in `latency`, `balanced`, and `recall` modes |
 | Offline evaluation | implemented | Computes Recall@K, NDCG@K, P95/P99 latency |
+| Rerank v1 | implemented | Reranks candidates with external cross-encoder, LLM, or rule-based scores and citation metadata |
+| Retrieval explain | implemented v1 | Reports stage counts, overlap, and likely failure reason |
 | disk graph | planned | Disk-oriented vector graph retrieval for larger datasets |
-| FTS rerank | planned | Richer sparse retrieval reranking module |
 
 ### 1.2 Repository Layout
 
@@ -33,7 +38,7 @@ contrib/pg_retrieval_engine/
 │   ├── faiss_in_pg/                # FAISS C++ execution engine
 │   ├── rrf_sql/                    # RRF SQL fusion module notes
 │   ├── disk_graph/                 # Planned disk graph module
-│   └── fts_rerank/                 # Planned full-text rerank module
+│   └── fts_rerank/                 # SQL rerank v1 module notes
 ├── docs/                           # Architecture, API, usage, benchmark, module design docs
 ├── evals/                          # Offline metrics scripts, qrels, sample run files
 ├── bench/                          # Benchmark/ablation script entry points
@@ -48,9 +53,11 @@ contrib/pg_retrieval_engine/
 |---|---|---|---|
 | FAISS in PostgreSQL | ANN vector retrieval | Recall@10, avg latency, P95/P99 latency, speedup vs pgvector | CPU target `>=5x`; measured batch HNSW `11.32x`, IVFFlat `10.31x` on the local sample |
 | RRF SQL | Hybrid ranking fusion | Recall@K, NDCG@K, P95/P99 latency, vector/FTS/RRF ablation | vector-only, FTS-only, and RRF runs must be reported together |
+| Ingest/chunk/embedding queue | Data preparation | chunk counts, incremental job counts, metadata/citation completeness | external parsers and embedding workers stay outside the extension |
 | Observability/autotune | Runtime quality | search calls, avg latency, last_candidate_k, preferred_batch_size, before/after recall and latency | every tuning change must be re-evaluated with fixed qrels |
 | Offline evaluation | Acceptance metrics | Recall@K, NDCG@K, latency_p95_ms, latency_p99_ms | supported by `evals/run_eval.py` |
-| disk graph / FTS rerank | Future modules | same quality and tail-latency metrics as FAISS/RRF | module-specific benchmark docs required before implementation |
+| Rerank v1 | Candidate reranking | Recall@K, NDCG@K, P95/P99 latency, rerank ablation | compare base, cross-encoder, LLM, and rule-based variants |
+| disk graph | Future module | same quality and tail-latency metrics as FAISS/RRF | module-specific benchmark docs required before implementation |
 
 ## 2. Build and Install
 

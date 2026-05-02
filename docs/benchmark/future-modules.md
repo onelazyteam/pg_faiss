@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines the benchmark contract for planned modules such as `disk_graph` and `fts_rerank`.
+This document defines the benchmark contract for future modules such as `disk_graph`, and for rerank ablations that compare `fts_rerank` variants.
 
 ## Required Before Implementation
 

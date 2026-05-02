@@ -7,10 +7,13 @@ next to the module they describe, and keep this file as the top-level map.
 
 | Module | Document | Runtime status |
 |---|---|---|
+| Document ingest, chunking, embedding queue | [design/future-modules.md](design/future-modules.md) | SQL v1 implemented |
 | FAISS in PostgreSQL | [design/faiss-in-pg.md](design/faiss-in-pg.md) | implemented |
 | RRF SQL fusion | [design/rrf-sql.md](design/rrf-sql.md) | implemented |
 | Evaluation metrics | [design/evaluation.md](design/evaluation.md) | implemented offline |
 | Observability and autotune | [design/observability-autotune.md](design/observability-autotune.md) | implemented for FAISS path |
+| Rerank v1 | [design/future-modules.md](design/future-modules.md) | SQL rerank implemented |
+| Retrieval explain | [design/future-modules.md](design/future-modules.md) | SQL v1 implemented |
 | Future modules | [design/future-modules.md](design/future-modules.md) | scaffold |
 
 ## Release Checklist

@@ -57,7 +57,32 @@ CREATE EXTENSION pg_retrieval_engine;
 
 ## 3. 快速开始
 
-### 3.1 创建与写入
+### 3.1 文档导入、Chunk 与增量向量化队列
+
+```sql
+SELECT pg_retrieval_engine_document_upsert(
+  'file:///docs/retrieval.md',
+  'markdown',
+  '...',
+  '{"repo":"demo","path":"docs/retrieval.md"}'::jsonb,
+  'Retrieval Doc'
+);
+
+SELECT *
+FROM pg_retrieval_engine_chunk_document(
+  1,
+  1000,
+  100,
+  '{"parent_chunk_size":3000}'::jsonb
+);
+
+SELECT pg_retrieval_engine_embedding_version_create('bge-m3', '2026-05', 1024);
+SELECT pg_retrieval_engine_enqueue_embedding_jobs(1);
+```
+
+PDF/HTML/Markdown 解析和 embedding 推理由外部 worker 完成；扩展负责存储抽取文本、chunk、metadata、citation metadata 和增量任务状态。
+
+### 3.2 创建与写入
 
 ```sql
 SELECT pg_retrieval_engine_index_create(
@@ -77,7 +102,7 @@ SELECT pg_retrieval_engine_index_add(
 );
 ```
 
-### 3.2 单查询
+### 3.3 单查询
 
 ```sql
 SELECT *
@@ -89,7 +114,7 @@ FROM pg_retrieval_engine_index_search(
 );
 ```
 
-### 3.3 批查询（优化路径）
+### 3.4 批查询（优化路径）
 
 ```sql
 SELECT *
@@ -171,7 +196,54 @@ FROM pg_retrieval_engine_hybrid_search(
 );
 ```
 
-### 4.6 离线评测
+### 4.6 候选精排
+
+Cross-encoder 分数由应用或外部模型服务计算，再传回 PostgreSQL 做确定性精排：
+
+```sql
+SELECT id, final_score, base_rank, cross_encoder_score
+FROM pg_retrieval_engine_rerank(
+  ARRAY[101,102,103]::bigint[],
+  3,
+  ARRAY[0.20,0.95,0.40]::double precision[],
+  NULL,
+  NULL,
+  NULL,
+  '{"base_weight":0,"cross_encoder_weight":1}'::jsonb
+);
+```
+
+LLM rerank 分数使用同一接口：
+
+```sql
+SELECT id, final_score, llm_score
+FROM pg_retrieval_engine_rerank(
+  ARRAY[101,102,103]::bigint[],
+  2,
+  NULL,
+  ARRAY[0.70,0.20,0.90]::double precision[],
+  NULL,
+  NULL,
+  '{"base_weight":0,"llm_weight":1}'::jsonb
+);
+```
+
+Rule-based rerank 可以由 SQL 规则特征生成 `rule_scores` 后传入：
+
+```sql
+SELECT id, final_score, rule_score
+FROM pg_retrieval_engine_rerank(
+  ARRAY[101,102,103]::bigint[],
+  3,
+  NULL,
+  NULL,
+  ARRAY[1.0,0.0,0.5]::double precision[],
+  NULL,
+  '{"base_weight":0.2,"rule_weight":1,"score_normalization":"minmax"}'::jsonb
+);
+```
+
+### 4.7 离线评测
 
 ```bash
 python3 evals/run_eval.py \

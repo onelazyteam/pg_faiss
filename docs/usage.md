@@ -57,7 +57,32 @@ CREATE EXTENSION pg_retrieval_engine;
 
 ## 3. Quick Start
 
-### 3.1 Create and insert
+### 3.1 Document ingest, chunking, and incremental embedding queue
+
+```sql
+SELECT pg_retrieval_engine_document_upsert(
+  'file:///docs/retrieval.md',
+  'markdown',
+  '...',
+  '{"repo":"demo","path":"docs/retrieval.md"}'::jsonb,
+  'Retrieval Doc'
+);
+
+SELECT *
+FROM pg_retrieval_engine_chunk_document(
+  1,
+  1000,
+  100,
+  '{"parent_chunk_size":3000}'::jsonb
+);
+
+SELECT pg_retrieval_engine_embedding_version_create('bge-m3', '2026-05', 1024);
+SELECT pg_retrieval_engine_enqueue_embedding_jobs(1);
+```
+
+PDF/HTML/Markdown parsing and embedding inference run in an external worker. The extension stores extracted text, chunks, metadata, citation metadata, and incremental job state.
+
+### 3.2 Create and insert
 
 ```sql
 SELECT pg_retrieval_engine_index_create(
@@ -77,7 +102,7 @@ SELECT pg_retrieval_engine_index_add(
 );
 ```
 
-### 3.2 Single-query search
+### 3.3 Single-query search
 
 ```sql
 SELECT *
@@ -89,7 +114,7 @@ FROM pg_retrieval_engine_index_search(
 );
 ```
 
-### 3.3 Batch search (optimized path)
+### 3.4 Batch search (optimized path)
 
 ```sql
 SELECT *
@@ -171,7 +196,54 @@ FROM pg_retrieval_engine_hybrid_search(
 );
 ```
 
-### 4.6 Offline evaluation
+### 4.6 Rerank candidates
+
+Cross-encoder scores are computed by the application or an external model service, then passed back to PostgreSQL for deterministic reranking:
+
+```sql
+SELECT id, final_score, base_rank, cross_encoder_score
+FROM pg_retrieval_engine_rerank(
+  ARRAY[101,102,103]::bigint[],
+  3,
+  ARRAY[0.20,0.95,0.40]::double precision[],
+  NULL,
+  NULL,
+  NULL,
+  '{"base_weight":0,"cross_encoder_weight":1}'::jsonb
+);
+```
+
+LLM rerank scores use the same contract:
+
+```sql
+SELECT id, final_score, llm_score
+FROM pg_retrieval_engine_rerank(
+  ARRAY[101,102,103]::bigint[],
+  2,
+  NULL,
+  ARRAY[0.70,0.20,0.90]::double precision[],
+  NULL,
+  NULL,
+  '{"base_weight":0,"llm_weight":1}'::jsonb
+);
+```
+
+Rule-based rerank can be built with SQL features and passed as `rule_scores`:
+
+```sql
+SELECT id, final_score, rule_score
+FROM pg_retrieval_engine_rerank(
+  ARRAY[101,102,103]::bigint[],
+  3,
+  NULL,
+  NULL,
+  ARRAY[1.0,0.0,0.5]::double precision[],
+  NULL,
+  '{"base_weight":0.2,"rule_weight":1,"score_normalization":"minmax"}'::jsonb
+);
+```
+
+### 4.7 Offline evaluation
 
 ```bash
 python3 evals/run_eval.py \

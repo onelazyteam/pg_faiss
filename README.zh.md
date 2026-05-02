@@ -16,12 +16,17 @@
 | 向量检索 API | 已实现 | 支持 `hnsw`、`ivfflat`、`ivfpq`，支持 `l2`、`ip`、`cosine` |
 | 批量检索优化 | 已实现 | 通过 `batch_size` 分块执行，降低大批量查询内存峰值 |
 | 过滤检索 | 已实现 | ANN 结果按 `filter_ids` allow-list 过滤 |
+| 文档导入与 chunk | 已实现 v1 | 登记多源文本、结构化 chunk、parent-child chunk、metadata/citation metadata |
+| Embedding 版本与增量队列 | 已实现 v1 | 管理 embedding model/version，按 chunk content hash 生成增量向量化任务 |
+| pgvector 索引管理 | 已实现 v1 | 创建 `pgvector` HNSW / IVFFlat 索引 |
 | RRF 融合 | 已实现 | 融合 pgvector 排名与 PostgreSQL `tsvector` 全文检索排名 |
+| FAISS + FTS 双路召回 | 已实现 v1 | FAISS dense 与 `tsvector` sparse 双路召回后执行 RRF |
 | 可观测性 | 已实现 | 暴露 runtime counters、耗时、最近查询参数 |
 | 自动调参 | 已实现 | `latency` / `balanced` / `recall` 模式调整搜索默认参数 |
 | 离线评测 | 已实现 | 计算 Recall@K、NDCG@K、P95/P99 latency |
+| Rerank v1 | 已实现 | 基于外部 cross-encoder、LLM 或 rule-based 分数对候选集精排，支持 citation metadata 输出 |
+| Retrieval explain | 已实现 v1 | 输出召回阶段计数、重叠情况和 likely failure reason |
 | disk graph | 规划中 | 面向更大规模向量的磁盘图检索模块 |
-| FTS rerank | 规划中 | 更完整的稀疏检索 rerank 模块 |
 
 ### 1.2 目录结构
 
@@ -35,7 +40,7 @@ contrib/pg_retrieval_engine/
 │   ├── faiss_in_pg/                # FAISS C++ 执行引擎
 │   ├── rrf_sql/                    # RRF SQL 融合模块说明
 │   ├── disk_graph/                 # 规划中的磁盘图检索模块
-│   └── fts_rerank/                 # 规划中的全文 rerank 模块
+│   └── fts_rerank/                 # SQL rerank v1 模块说明
 ├── docs/                           # 架构、API、使用、benchmark、模块设计文档
 ├── evals/                          # 离线评测脚本、qrels、样例 run 文件
 ├── bench/                          # benchmark/ablation 脚本入口
@@ -50,9 +55,11 @@ contrib/pg_retrieval_engine/
 |---|---|---|---|
 | FAISS in PostgreSQL | ANN 向量检索 | Recall@10、avg latency、P95/P99 latency、pgvector speedup | CPU 目标 `>=5x`；本机 batch HNSW 实测 `11.32x`，IVFFlat 实测 `10.31x` |
 | RRF SQL | 混合检索融合 | Recall@K、NDCG@K、P95/P99 latency、vector/FTS/RRF ablation | 必须同时报告 vector-only、FTS-only、RRF 三组结果 |
+| Ingest/Chunk/Embedding 队列 | 数据准备 | chunk 数量、增量任务数、metadata/citation 完整性 | 外部 parser/embedding worker 与 SQL API 解耦 |
 | 可观测性/自动调参 | 线上运行质量 | search calls、avg latency、last_candidate_k、preferred_batch_size、调参前后 Recall/Latency | 调参前后必须用统一 qrels 复测 |
 | 离线评测 | 质量验收 | Recall@K、NDCG@K、latency_p95_ms、latency_p99_ms | `evals/run_eval.py` 已支持 |
-| disk graph / FTS rerank | 后续模块 | 与 FAISS/RRF 相同的质量与尾延迟指标 | 进入实现前先补独立 benchmark 文档 |
+| Rerank v1 | 候选精排 | Recall@K、NDCG@K、P95/P99 latency、rerank ablation | 对比 base、cross-encoder、LLM 与 rule-based 变体 |
+| disk graph | 后续模块 | 与 FAISS/RRF 相同的质量与尾延迟指标 | 进入实现前先补独立 benchmark 文档 |
 
 ## 2. 编译安装
 

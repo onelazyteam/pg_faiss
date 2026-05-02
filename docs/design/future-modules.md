@@ -12,13 +12,14 @@ Target responsibility:
 
 ## `src/fts_rerank`
 
-Status: scaffold.
+Status: SQL rerank v1 implemented.
 
 Target responsibility:
 
-- Sparse/FTS rerank helpers beyond basic `tsvector` candidate generation.
-- Optional feature weighting, normalization, and rerank diagnostics.
+- Cross-encoder, LLM, and rule-based rerank helpers beyond base candidates.
+- Optional weighting, `none` / `minmax` normalization, and rerank diagnostics.
 - Compatibility with RRF fusion outputs.
+- Model inference does not run inside the PostgreSQL backend; the extension receives externally computed scores.
 
 ## Integration Contract
 

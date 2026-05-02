@@ -2,7 +2,7 @@
 
 ## 范围
 
-本文定义 `disk_graph`、`fts_rerank` 等规划模块的 benchmark 契约。
+本文定义 `disk_graph` 等后续模块的 benchmark 契约，并覆盖 `fts_rerank` 变体的 rerank ablation 对比。
 
 ## 实现前必须明确
 
