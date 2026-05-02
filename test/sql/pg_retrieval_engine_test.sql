@@ -3,6 +3,51 @@ CREATE EXTENSION pg_retrieval_engine;
 
 SELECT pg_retrieval_engine_reset() IS NOT NULL AS reset_ok;
 
+\pset format unaligned
+
+SELECT pg_retrieval_engine_document_upsert(
+    'file:///docs/retrieval.md',
+    'markdown',
+    'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda',
+    '{"repo":"demo","path":"docs/retrieval.md"}'::jsonb,
+    'Retrieval Doc'
+) > 0 AS document_upsert_ok;
+
+SELECT count(*) FILTER (WHERE chunk_type = 'parent') AS parent_chunks,
+       count(*) FILTER (WHERE chunk_type = 'child') AS child_chunks,
+       bool_and(citation_metadata ? 'source_uri') AS has_citations
+FROM pg_retrieval_engine_chunk_document(
+    (SELECT id FROM pg_retrieval_engine_documents WHERE source_uri = 'file:///docs/retrieval.md'),
+    20,
+    5,
+    '{"parent_chunk_size":40}'::jsonb
+);
+
+SELECT pg_retrieval_engine_embedding_version_create(
+    'demo-embed',
+    'v1',
+    4,
+    'cosine',
+    '{"provider":"test"}'::jsonb
+) > 0 AS embedding_version_ok;
+
+SELECT pg_retrieval_engine_enqueue_embedding_jobs(
+    (SELECT id FROM pg_retrieval_engine_embedding_versions WHERE model_name = 'demo-embed' AND model_version = 'v1')
+) > 0 AS embedding_jobs_enqueued;
+
+SELECT pg_retrieval_engine_embedding_job_complete(
+    (SELECT min(id) FROM pg_retrieval_engine_embedding_jobs),
+    '[1,0,0,0]'::vector,
+    '{"source":"regress"}'::jsonb
+) IS NOT NULL AS embedding_job_complete_ok;
+
+SELECT count(*) FILTER (WHERE embedding IS NOT NULL) AS embedded_chunks,
+       count(*) FILTER (WHERE status = 'done') AS done_jobs
+FROM pg_retrieval_engine_chunks c
+LEFT JOIN pg_retrieval_engine_embedding_jobs j ON j.chunk_id = c.id;
+
+\pset format aligned
+
 SELECT pg_retrieval_engine_index_create(
     'idx_h',
     4,
@@ -123,6 +168,31 @@ INSERT INTO rrf_docs VALUES
     (3, '[0,1,0,0]'::vector, to_tsvector('simple', 'banana text search')),
     (4, '[0,0,1,0]'::vector, to_tsvector('simple', 'apple apple full text'));
 
+\pset format unaligned
+
+SELECT pg_retrieval_engine_pgvector_index_create(
+    'rrf_docs'::regclass,
+    'embedding',
+    'hnsw',
+    'vector_l2_ops',
+    '{"m":8,"ef_construction":16}'::jsonb
+) LIKE '%embedding_hnsw_idx' AS pgvector_hnsw_index_ok;
+
+SELECT pg_retrieval_engine_pgvector_index_create(
+    'rrf_docs'::regclass,
+    'embedding',
+    'ivfflat',
+    'vector_l2_ops',
+    '{"lists":1}'::jsonb
+) LIKE '%embedding_ivfflat_idx' AS pgvector_ivfflat_index_ok;
+
+SELECT pg_retrieval_engine_tsvector_index_create(
+    'rrf_docs'::regclass,
+    'search_vector'
+) LIKE '%search_vector_gin_idx' AS tsvector_index_ok;
+
+\pset format aligned
+
 SELECT id,
        vector_rank,
        fts_rank,
@@ -138,6 +208,98 @@ FROM pg_retrieval_engine_hybrid_search(
     3,
     '{"vector_k":2,"fts_k":2,"rrf_k":60,"rank_function":"ts_rank","normalization":0}'::jsonb
 );
+
+\pset format unaligned
+
+SELECT count(*) AS faiss_hybrid_rows
+FROM pg_retrieval_engine_hybrid_search_faiss(
+    'rrf_docs'::regclass,
+    'id',
+    'search_vector',
+    'idx_h',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":3,"fts_k":3,"rrf_k":60,"rank_function":"ts_rank","normalization":0}'::jsonb
+);
+
+SELECT format('%s|%s|%s|%s', id, base_rank, round(final_score::numeric, 6), round(base_score::numeric, 6)) AS rerank_base
+FROM pg_retrieval_engine_rerank(ARRAY[10,20,30]::bigint[], 2);
+
+SELECT format('%s|%s|%s|%s', id, base_rank, round(final_score::numeric, 6), cross_encoder_score) AS rerank_cross_encoder
+FROM pg_retrieval_engine_rerank(
+    ARRAY[10,20,30]::bigint[],
+    3,
+    ARRAY[0.1,0.9,0.2]::double precision[],
+    NULL,
+    NULL,
+    NULL,
+    '{"base_weight":0,"cross_encoder_weight":1}'::jsonb
+);
+
+SELECT format('%s|%s|%s|%s', id, round(final_score::numeric, 6), llm_score, rule_score) AS rerank_llm_rule
+FROM pg_retrieval_engine_rerank(
+    ARRAY[1,2,3]::bigint[],
+    3,
+    NULL,
+    ARRAY[0.4,0.1,0.7]::double precision[],
+    ARRAY[1.0,0.0,0.2]::double precision[],
+    ARRAY[0.0,0.0,0.0]::double precision[],
+    '{"base_weight":0,"cross_encoder_weight":0,"llm_weight":2,"rule_weight":0.5}'::jsonb
+);
+
+SELECT format('%s|%s', id, round(final_score::numeric, 6)) AS rerank_minmax
+FROM pg_retrieval_engine_rerank(
+    ARRAY[1,2,3]::bigint[],
+    3,
+    ARRAY[5.0,10.0,15.0]::double precision[],
+    NULL,
+    NULL,
+    ARRAY[10.0,20.0,30.0]::double precision[],
+    '{"base_weight":1,"cross_encoder_weight":1,"llm_weight":0,"rule_weight":0,"score_normalization":"minmax"}'::jsonb
+);
+
+SELECT format('%s|%s|%s', id, base_rank, cross_encoder_score) AS rerank_dedup
+FROM pg_retrieval_engine_rerank(
+    ARRAY[5,6,5,7]::bigint[],
+    4,
+    ARRAY[0.1,0.2,0.9,0.3]::double precision[],
+    NULL,
+    NULL,
+    NULL,
+    '{"base_weight":0,"cross_encoder_weight":1}'::jsonb
+);
+
+SELECT format('%s|%s', id, citation->>'source_uri') AS rerank_citation
+FROM pg_retrieval_engine_rerank_with_citations(
+    ARRAY[10,20]::bigint[],
+    ARRAY['{"source_uri":"file:///a.md"}'::jsonb, '{"source_uri":"file:///b.md"}'::jsonb],
+    2,
+    ARRAY[0.1,0.9]::double precision[],
+    NULL,
+    NULL,
+    NULL,
+    '{"base_weight":0,"cross_encoder_weight":1}'::jsonb
+);
+
+SELECT pg_retrieval_engine_retrieval_explain(
+    ARRAY[1,2]::bigint[],
+    ARRAY[2,3]::bigint[],
+    ARRAY[2]::bigint[],
+    ARRAY[1,2,4]::bigint[],
+    '{}'::jsonb
+)->>'likely_failure_reason' AS explain_reason;
+
+SELECT pg_retrieval_engine_rerank(ARRAY[1]::bigint[], 0);
+SELECT pg_retrieval_engine_rerank(ARRAY[1,2]::bigint[], 2, ARRAY[0.1]::double precision[]);
+SELECT pg_retrieval_engine_rerank(ARRAY[1]::bigint[], 1, NULL, NULL, NULL, NULL, '{"base_weight":-1}'::jsonb);
+SELECT pg_retrieval_engine_rerank(ARRAY[1]::bigint[], 1, NULL, NULL, NULL, NULL, '{"rank_k":0}'::jsonb);
+SELECT pg_retrieval_engine_rerank(ARRAY[1]::bigint[], 1, NULL, NULL, NULL, NULL, '{"score_normalization":"zscore"}'::jsonb);
+SELECT pg_retrieval_engine_document_upsert('', 'markdown', 'x');
+SELECT pg_retrieval_engine_chunk_document(999999, 10, 0);
+SELECT pg_retrieval_engine_pgvector_index_create('rrf_docs'::regclass, 'embedding', 'bad');
+
+\pset format aligned
 
 DROP TABLE rrf_docs;
 

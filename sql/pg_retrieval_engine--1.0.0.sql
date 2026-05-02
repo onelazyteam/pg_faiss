@@ -809,3 +809,539 @@ IS 'Fuse vector and full-text ranked ID lists with Reciprocal Rank Fusion.';
 
 COMMENT ON FUNCTION pg_retrieval_engine_hybrid_search(regclass, name, name, name, vector, tsquery, integer, jsonb)
 IS 'Run pgvector and PostgreSQL tsvector retrieval over one table, then merge rankings with Reciprocal Rank Fusion.';
+
+CREATE FUNCTION pg_retrieval_engine_hybrid_search_faiss(
+    table_name regclass,
+    id_column name,
+    tsvector_column name,
+    faiss_index_name text,
+    query_vector vector,
+    query_tsquery tsquery,
+    k integer,
+    options jsonb DEFAULT '{}'::jsonb
+) RETURNS TABLE(
+    id bigint,
+    rrf_score double precision,
+    vector_rank integer,
+    fts_rank integer,
+    vector_distance real,
+    fts_score real
+)
+LANGUAGE plpgsql
+STABLE
+STRICT
+AS $$
+DECLARE
+    vector_k integer;
+    fts_k integer;
+    rrf_k double precision;
+    vector_weight double precision;
+    fts_weight double precision;
+    rank_function text;
+    normalization integer;
+    search_params jsonb;
+BEGIN
+    IF k < 1 THEN
+        RAISE EXCEPTION 'k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    vector_k := COALESCE((options->>'vector_k')::integer,
+                         (options->>'dense_k')::integer,
+                         GREATEST(k * 4, k));
+    fts_k := COALESCE((options->>'fts_k')::integer,
+                      (options->>'sparse_k')::integer,
+                      GREATEST(k * 4, k));
+    rrf_k := COALESCE((options->>'rrf_k')::double precision, 60.0);
+    vector_weight := COALESCE((options->>'vector_weight')::double precision,
+                              (options->>'dense_weight')::double precision,
+                              1.0);
+    fts_weight := COALESCE((options->>'fts_weight')::double precision,
+                           (options->>'sparse_weight')::double precision,
+                           1.0);
+    rank_function := COALESCE(options->>'rank_function', 'ts_rank_cd');
+    normalization := COALESCE((options->>'normalization')::integer, 32);
+    search_params := COALESCE(options->'faiss_search_params', '{}'::jsonb);
+
+    IF vector_k < 1 THEN
+        RAISE EXCEPTION 'vector_k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF fts_k < 1 THEN
+        RAISE EXCEPTION 'fts_k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF rrf_k <= 0 THEN
+        RAISE EXCEPTION 'rrf_k must be > 0' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF vector_weight < 0 THEN
+        RAISE EXCEPTION 'vector_weight must be >= 0' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF fts_weight < 0 THEN
+        RAISE EXCEPTION 'fts_weight must be >= 0' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF rank_function NOT IN ('ts_rank', 'ts_rank_cd') THEN
+        RAISE EXCEPTION 'rank_function must be ts_rank or ts_rank_cd'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF normalization < 0 OR normalization > 63 THEN
+        RAISE EXCEPTION 'normalization must be in range 0..63'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    RETURN QUERY EXECUTE format($sql$
+        WITH vector_results AS (
+            SELECT
+                s.id,
+                s.distance AS vector_distance,
+                row_number() OVER (ORDER BY s.distance, s.id)::integer AS vector_rank
+            FROM pg_retrieval_engine_index_search($1, $2, %4$s, $3) AS s
+        ),
+        fts_results AS (
+            SELECT
+                %1$I::bigint AS id,
+                pg_catalog.%8$s(%2$I, $4, %9$s)::real AS fts_score,
+                row_number() OVER (ORDER BY pg_catalog.%8$s(%2$I, $4, %9$s) DESC, %1$I)::integer AS fts_rank
+            FROM %3$s
+            WHERE %2$I @@ $4
+            ORDER BY pg_catalog.%8$s(%2$I, $4, %9$s) DESC, %1$I
+            LIMIT %5$s
+        ),
+        fused AS (
+            SELECT
+                COALESCE(v.id, f.id) AS id,
+                CASE WHEN v.vector_rank IS NULL THEN 0.0
+                     ELSE $5::double precision / ($6::double precision + v.vector_rank::double precision)
+                END
+                +
+                CASE WHEN f.fts_rank IS NULL THEN 0.0
+                     ELSE $7::double precision / ($6::double precision + f.fts_rank::double precision)
+                END AS rrf_score,
+                v.vector_rank,
+                f.fts_rank,
+                v.vector_distance,
+                f.fts_score
+            FROM vector_results v
+            FULL OUTER JOIN fts_results f USING (id)
+        )
+        SELECT id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score
+        FROM fused
+        ORDER BY rrf_score DESC,
+                 LEAST(COALESCE(vector_rank, 2147483647),
+                       COALESCE(fts_rank, 2147483647)),
+                 id
+        LIMIT %6$s
+    $sql$,
+        id_column,
+        tsvector_column,
+        table_name,
+        vector_k,
+        fts_k,
+        k,
+        rrf_k,
+        rank_function,
+        normalization)
+    USING faiss_index_name, query_vector, search_params, query_tsquery,
+          vector_weight, rrf_k, fts_weight;
+END;
+$$;
+
+CREATE FUNCTION pg_retrieval_engine_rerank(
+    candidate_ids bigint[],
+    k integer,
+    cross_encoder_scores double precision[] DEFAULT NULL,
+    llm_scores double precision[] DEFAULT NULL,
+    rule_scores double precision[] DEFAULT NULL,
+    base_scores double precision[] DEFAULT NULL,
+    options jsonb DEFAULT '{}'::jsonb
+) RETURNS TABLE(
+    id bigint,
+    final_score double precision,
+    base_rank integer,
+    base_score double precision,
+    cross_encoder_score double precision,
+    llm_score double precision,
+    rule_score double precision,
+    diagnostics jsonb
+)
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    candidate_count integer;
+    base_weight double precision;
+    cross_encoder_weight double precision;
+    llm_weight double precision;
+    rule_weight double precision;
+    rank_k double precision;
+    score_normalization text;
+BEGIN
+    IF candidate_ids IS NULL THEN
+        RAISE EXCEPTION 'candidate_ids must not be null' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF k < 1 THEN
+        RAISE EXCEPTION 'k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    candidate_count := cardinality(candidate_ids);
+
+    IF cross_encoder_scores IS NOT NULL AND cardinality(cross_encoder_scores) <> candidate_count THEN
+        RAISE EXCEPTION 'cross_encoder_scores length must match candidate_ids length'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF llm_scores IS NOT NULL AND cardinality(llm_scores) <> candidate_count THEN
+        RAISE EXCEPTION 'llm_scores length must match candidate_ids length'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF rule_scores IS NOT NULL AND cardinality(rule_scores) <> candidate_count THEN
+        RAISE EXCEPTION 'rule_scores length must match candidate_ids length'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF base_scores IS NOT NULL AND cardinality(base_scores) <> candidate_count THEN
+        RAISE EXCEPTION 'base_scores length must match candidate_ids length'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    base_weight := COALESCE((options->>'base_weight')::double precision, 1.0);
+    cross_encoder_weight := COALESCE((options->>'cross_encoder_weight')::double precision, 1.0);
+    llm_weight := COALESCE((options->>'llm_weight')::double precision, 1.0);
+    rule_weight := COALESCE((options->>'rule_weight')::double precision, 1.0);
+    rank_k := COALESCE((options->>'rank_k')::double precision, 60.0);
+    score_normalization := COALESCE(options->>'score_normalization', 'none');
+
+    IF base_weight < 0 THEN
+        RAISE EXCEPTION 'base_weight must be >= 0' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF cross_encoder_weight < 0 THEN
+        RAISE EXCEPTION 'cross_encoder_weight must be >= 0' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF llm_weight < 0 THEN
+        RAISE EXCEPTION 'llm_weight must be >= 0' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF rule_weight < 0 THEN
+        RAISE EXCEPTION 'rule_weight must be >= 0' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF rank_k <= 0 THEN
+        RAISE EXCEPTION 'rank_k must be > 0' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF score_normalization NOT IN ('none', 'minmax') THEN
+        RAISE EXCEPTION 'score_normalization must be none or minmax'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    RETURN QUERY
+    WITH raw_candidates AS (
+        SELECT
+            ids.id,
+            ids.ord::integer AS base_rank,
+            CASE WHEN base_scores IS NULL
+                 THEN 1.0 / (rank_k + ids.ord::double precision)
+                 ELSE base_scores[ids.ord]
+            END AS base_score,
+            CASE WHEN cross_encoder_scores IS NULL THEN NULL ELSE cross_encoder_scores[ids.ord] END AS cross_encoder_score,
+            CASE WHEN llm_scores IS NULL THEN NULL ELSE llm_scores[ids.ord] END AS llm_score,
+            CASE WHEN rule_scores IS NULL THEN NULL ELSE rule_scores[ids.ord] END AS rule_score
+        FROM unnest(candidate_ids) WITH ORDINALITY AS ids(id, ord)
+    ),
+    candidates AS (
+        SELECT DISTINCT ON (raw_candidates.id)
+            raw_candidates.id,
+            raw_candidates.base_rank,
+            raw_candidates.base_score,
+            raw_candidates.cross_encoder_score,
+            raw_candidates.llm_score,
+            raw_candidates.rule_score
+        FROM raw_candidates
+        ORDER BY raw_candidates.id, raw_candidates.base_rank
+    ),
+    stats AS (
+        SELECT
+            min(candidates.base_score) AS base_min,
+            max(candidates.base_score) AS base_max,
+            min(candidates.cross_encoder_score) AS cross_encoder_min,
+            max(candidates.cross_encoder_score) AS cross_encoder_max,
+            min(candidates.llm_score) AS llm_min,
+            max(candidates.llm_score) AS llm_max,
+            min(candidates.rule_score) AS rule_min,
+            max(candidates.rule_score) AS rule_max
+        FROM candidates
+    ),
+    normalized AS (
+        SELECT
+            c.id,
+            c.base_rank,
+            c.base_score,
+            c.cross_encoder_score,
+            c.llm_score,
+            c.rule_score,
+            CASE
+                WHEN score_normalization = 'minmax' AND s.base_max > s.base_min
+                    THEN (c.base_score - s.base_min) / (s.base_max - s.base_min)
+                WHEN score_normalization = 'minmax'
+                    THEN 0.0
+                ELSE c.base_score
+            END AS base_component,
+            CASE
+                WHEN score_normalization = 'minmax' AND s.cross_encoder_max > s.cross_encoder_min
+                    THEN (c.cross_encoder_score - s.cross_encoder_min) / (s.cross_encoder_max - s.cross_encoder_min)
+                WHEN score_normalization = 'minmax' AND c.cross_encoder_score IS NOT NULL
+                    THEN 0.0
+                ELSE c.cross_encoder_score
+            END AS cross_encoder_component,
+            CASE
+                WHEN score_normalization = 'minmax' AND s.llm_max > s.llm_min
+                    THEN (c.llm_score - s.llm_min) / (s.llm_max - s.llm_min)
+                WHEN score_normalization = 'minmax' AND c.llm_score IS NOT NULL
+                    THEN 0.0
+                ELSE c.llm_score
+            END AS llm_component,
+            CASE
+                WHEN score_normalization = 'minmax' AND s.rule_max > s.rule_min
+                    THEN (c.rule_score - s.rule_min) / (s.rule_max - s.rule_min)
+                WHEN score_normalization = 'minmax' AND c.rule_score IS NOT NULL
+                    THEN 0.0
+                ELSE c.rule_score
+            END AS rule_component
+        FROM candidates c
+        CROSS JOIN stats s
+    ),
+    scored AS (
+        SELECT
+            n.id,
+            (
+                base_weight * COALESCE(n.base_component, 0.0) +
+                cross_encoder_weight * COALESCE(n.cross_encoder_component, 0.0) +
+                llm_weight * COALESCE(n.llm_component, 0.0) +
+                rule_weight * COALESCE(n.rule_component, 0.0)
+            ) AS final_score,
+            n.base_rank,
+            n.base_score,
+            n.cross_encoder_score,
+            n.llm_score,
+            n.rule_score,
+            jsonb_build_object(
+                'score_normalization', score_normalization,
+                'rank_k', rank_k,
+                'weights', jsonb_build_object(
+                    'base', base_weight,
+                    'cross_encoder', cross_encoder_weight,
+                    'llm', llm_weight,
+                    'rule', rule_weight
+                ),
+                'components', jsonb_build_object(
+                    'base', n.base_component,
+                    'cross_encoder', n.cross_encoder_component,
+                    'llm', n.llm_component,
+                    'rule', n.rule_component
+                )
+            ) AS diagnostics
+        FROM normalized n
+    )
+    SELECT
+        scored.id,
+        scored.final_score,
+        scored.base_rank,
+        scored.base_score,
+        scored.cross_encoder_score,
+        scored.llm_score,
+        scored.rule_score,
+        scored.diagnostics
+    FROM scored
+    ORDER BY scored.final_score DESC, scored.base_rank, scored.id
+    LIMIT k;
+END;
+$$;
+
+COMMENT ON FUNCTION pg_retrieval_engine_rerank(bigint[], integer, double precision[], double precision[], double precision[], double precision[], jsonb)
+IS 'Rerank candidate IDs with externally supplied cross-encoder, LLM, rule-based, and base scores.';
+
+CREATE FUNCTION pg_retrieval_engine_rerank_with_citations(
+    candidate_ids bigint[],
+    citation_metadata jsonb[],
+    k integer,
+    cross_encoder_scores double precision[] DEFAULT NULL,
+    llm_scores double precision[] DEFAULT NULL,
+    rule_scores double precision[] DEFAULT NULL,
+    base_scores double precision[] DEFAULT NULL,
+    options jsonb DEFAULT '{}'::jsonb
+) RETURNS TABLE(
+    id bigint,
+    final_score double precision,
+    base_rank integer,
+    base_score double precision,
+    cross_encoder_score double precision,
+    llm_score double precision,
+    rule_score double precision,
+    citation jsonb,
+    diagnostics jsonb
+)
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    candidate_count integer;
+BEGIN
+    IF candidate_ids IS NULL THEN
+        RAISE EXCEPTION 'candidate_ids must not be null' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    candidate_count := cardinality(candidate_ids);
+
+    IF citation_metadata IS NOT NULL AND cardinality(citation_metadata) <> candidate_count THEN
+        RAISE EXCEPTION 'citation_metadata length must match candidate_ids length'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    RETURN QUERY
+    SELECT
+        r.id,
+        r.final_score,
+        r.base_rank,
+        r.base_score,
+        r.cross_encoder_score,
+        r.llm_score,
+        r.rule_score,
+        CASE WHEN citation_metadata IS NULL THEN '{}'::jsonb
+             ELSE COALESCE(citation_metadata[r.base_rank], '{}'::jsonb)
+        END AS citation,
+        r.diagnostics
+    FROM pg_retrieval_engine_rerank(
+        candidate_ids,
+        k,
+        cross_encoder_scores,
+        llm_scores,
+        rule_scores,
+        base_scores,
+        options
+    ) AS r;
+END;
+$$;
+
+CREATE FUNCTION pg_retrieval_engine_retrieval_explain(
+    vector_ids bigint[] DEFAULT ARRAY[]::bigint[],
+    fts_ids bigint[] DEFAULT ARRAY[]::bigint[],
+    final_ids bigint[] DEFAULT ARRAY[]::bigint[],
+    relevant_ids bigint[] DEFAULT NULL,
+    options jsonb DEFAULT '{}'::jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    vector_count integer;
+    fts_count integer;
+    final_count integer;
+    overlap_count integer;
+    vector_only_count integer;
+    fts_only_count integer;
+    missing_relevant bigint[];
+    recalled_relevant bigint[];
+    reason text;
+BEGIN
+    vector_ids := COALESCE(vector_ids, ARRAY[]::bigint[]);
+    fts_ids := COALESCE(fts_ids, ARRAY[]::bigint[]);
+    final_ids := COALESCE(final_ids, ARRAY[]::bigint[]);
+
+    SELECT count(DISTINCT id)::integer INTO vector_count
+    FROM unnest(vector_ids) AS ids(id);
+
+    SELECT count(DISTINCT id)::integer INTO fts_count
+    FROM unnest(fts_ids) AS ids(id);
+
+    SELECT count(DISTINCT id)::integer INTO final_count
+    FROM unnest(final_ids) AS ids(id);
+
+    SELECT count(*)::integer INTO overlap_count
+    FROM (
+        SELECT DISTINCT id FROM unnest(vector_ids) AS v(id)
+        INTERSECT
+        SELECT DISTINCT id FROM unnest(fts_ids) AS f(id)
+    ) overlap_ids;
+
+    SELECT count(*)::integer INTO vector_only_count
+    FROM (
+        SELECT DISTINCT id FROM unnest(vector_ids) AS v(id)
+        EXCEPT
+        SELECT DISTINCT id FROM unnest(fts_ids) AS f(id)
+    ) vector_only_ids;
+
+    SELECT count(*)::integer INTO fts_only_count
+    FROM (
+        SELECT DISTINCT id FROM unnest(fts_ids) AS f(id)
+        EXCEPT
+        SELECT DISTINCT id FROM unnest(vector_ids) AS v(id)
+    ) fts_only_ids;
+
+    IF relevant_ids IS NULL THEN
+        missing_relevant := NULL;
+        recalled_relevant := NULL;
+        reason := CASE WHEN final_count = 0 THEN 'no_final_results' ELSE 'no_relevance_labels' END;
+    ELSE
+        SELECT COALESCE(array_agg(r.id ORDER BY r.id), ARRAY[]::bigint[])
+        INTO recalled_relevant
+        FROM unnest(relevant_ids) AS r(id)
+        WHERE r.id = ANY(final_ids);
+
+        SELECT COALESCE(array_agg(r.id ORDER BY r.id), ARRAY[]::bigint[])
+        INTO missing_relevant
+        FROM unnest(relevant_ids) AS r(id)
+        WHERE NOT r.id = ANY(final_ids);
+
+        IF cardinality(missing_relevant) = 0 THEN
+            reason := 'fully_recalled';
+        ELSIF EXISTS (
+            SELECT 1
+            FROM unnest(missing_relevant) AS m(id)
+            WHERE m.id = ANY(vector_ids) OR m.id = ANY(fts_ids)
+        ) THEN
+            reason := 'fusion_or_rerank_drop';
+        ELSE
+            reason := 'candidate_generation_miss';
+        END IF;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'stage_counts', jsonb_build_object(
+            'vector', vector_count,
+            'fts', fts_count,
+            'final', final_count,
+            'overlap', overlap_count,
+            'vector_only', vector_only_count,
+            'fts_only', fts_only_count
+        ),
+        'relevance', jsonb_build_object(
+            'recalled', recalled_relevant,
+            'missing', missing_relevant
+        ),
+        'likely_failure_reason', reason,
+        'options', COALESCE(options, '{}'::jsonb)
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION pg_retrieval_engine_document_upsert(text, text, text, jsonb, text)
+IS 'Register or update extracted source text for supported document types.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_chunk_document(bigint, integer, integer, jsonb)
+IS 'Create structured child chunks and optional parent chunks with metadata and citation metadata.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_embedding_version_create(text, text, integer, text, jsonb, boolean)
+IS 'Create or update an embedding model/version record.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_enqueue_embedding_jobs(bigint, boolean)
+IS 'Queue child chunks that need embedding for a model version.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_embedding_job_complete(bigint, vector, jsonb)
+IS 'Mark one embedding job complete and attach the produced vector to its chunk.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_pgvector_index_create(regclass, name, text, text, jsonb)
+IS 'Create a pgvector HNSW or IVFFlat index for a vector column.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_tsvector_index_create(regclass, name)
+IS 'Create a GIN index for a tsvector column.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_hybrid_search_faiss(regclass, name, name, text, vector, tsquery, integer, jsonb)
+IS 'Run FAISS dense retrieval and PostgreSQL tsvector retrieval, then fuse with RRF.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_rerank_with_citations(bigint[], jsonb[], integer, double precision[], double precision[], double precision[], double precision[], jsonb)
+IS 'Rerank candidate IDs and attach citation metadata aligned to the input candidate order.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_retrieval_explain(bigint[], bigint[], bigint[], bigint[], jsonb)
+IS 'Summarize retrieval stage counts and likely recall failure reasons.';
