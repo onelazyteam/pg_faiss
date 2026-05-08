@@ -2,7 +2,7 @@
 
 ## Scope
 
-`src/faiss_in_pg` owns the backend-local FAISS runtime:
+`src/faiss_in_pg` owns the backend-local FAISS runtime. In the current product positioning, pgvector is the production-consistent dense retrieval path and FAISS is an optional candidate accelerator / benchmark path:
 
 - Create, train, add, search, batch search, filtered search.
 - Save/load FAISS indexes with sidecar metadata.
@@ -28,6 +28,10 @@
 Indexes live in a backend-local hash table keyed by index name. They are not
 shared across sessions and are not WAL-replayed. The caller owns durable source
 data; this module owns fast runtime search over explicitly added vectors.
+
+FAISS results are not a source of truth. SQL hybrid search joins FAISS candidate
+IDs back to PostgreSQL rows before fusion so row visibility, scalar filters,
+metadata filters, and soft-delete checks can be applied.
 
 Single-query search applies per-call FAISS knobs, runs `index->search`, converts
 cosine scores when needed, and returns `(id, distance)`.

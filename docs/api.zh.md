@@ -2,7 +2,8 @@
 
 ## 1. 全局说明
 
-- 所有索引对象都存在于当前 PostgreSQL backend 进程内（非全局共享）。
+- pgvector 与 PostgreSQL 业务表是生产一致性的 source of truth。
+- FAISS 索引对象是 backend-local 可选加速器，不跨 session 全局共享。
 - 输入类型依赖 `pgvector`：`vector` / `vector[]`。
 - `metric='cosine'` 使用“归一化 + inner product”；返回值转换为 cosine distance（`1 - ip`）。
 - 当 `k > ntotal` 时，实际返回 `min(k, ntotal)`。
@@ -30,8 +31,9 @@
 | `pg_retrieval_engine_hybrid_search_faiss` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | FAISS + `tsvector` RRF 混合检索 |
 | `pg_retrieval_engine_rerank` | `table(id, final_score, base_rank, base_score, cross_encoder_score, llm_score, rule_score, diagnostics)` | 基于外部模型/规则分数的候选精排 |
 | `pg_retrieval_engine_rerank_with_citations` | `table(..., citation, diagnostics)` | 精排并按候选顺序附加 citation metadata |
-| `pg_retrieval_engine_retrieval_explain` | `jsonb` | 输出召回阶段计数和 likely failure reason |
-| `pg_retrieval_engine_index_autotune` | `jsonb` | 自动调参 |
+| `pg_retrieval_engine_retrieval_explain` | `jsonb` | 输出阶段计数、过滤、融合诊断和 likely failure reason |
+| `pg_retrieval_engine_hybrid_autotune` | `jsonb` | 为 hybrid search 推荐 latency/balanced/recall 参数 |
+| `pg_retrieval_engine_index_autotune` | `jsonb` | 自动调优 FAISS runtime 默认参数 |
 | `pg_retrieval_engine_metrics_reset` | `void` | 重置 runtime 指标 |
 | `pg_retrieval_engine_index_save` | `void` | 保存索引 |
 | `pg_retrieval_engine_index_load` | `void` | 加载索引 |
@@ -250,6 +252,10 @@ pg_retrieval_engine_hybrid_search(
 - `vector_operator`：`<=>`（默认，cosine distance）/ `<->`（L2）/ `<#>`（negative inner product）
 - `rank_function`：`ts_rank_cd`（默认）/ `ts_rank`
 - `normalization`：全文 rank normalization，默认 `32`
+- `filters`：标量列等值过滤，例如 `{"tenant_id":"acme"}`
+- `metadata_column`：JSONB metadata 列名，默认 `metadata`
+- `metadata_filter`：JSONB 包含过滤，执行为 `metadata_column @> metadata_filter`
+- `soft_delete_column`：软删除标记列，要求该列为 `NULL`
 
 ### 3.11 `pg_retrieval_engine_hybrid_search_faiss`
 
@@ -266,7 +272,11 @@ pg_retrieval_engine_hybrid_search_faiss(
 ) returns table(id bigint, rrf_score double precision, vector_rank int, fts_rank int, vector_distance real, fts_score real)
 ```
 
-使用 FAISS 索引执行 dense 召回，同时使用 PostgreSQL `tsvector` 执行 sparse 召回，然后在 SQL 内执行 RRF。
+使用 FAISS 索引执行 dense 召回，同时使用 PostgreSQL `tsvector` 执行 sparse 召回。FAISS 返回的候选 ID 会 join 回目标表进行行校验和过滤，然后在 SQL 内执行 RRF。
+
+支持与 `pg_retrieval_engine_hybrid_search` 相同的过滤选项。额外选项：
+
+- `faiss_distance_order`：`asc`（默认）或 `desc`；当 FAISS 路径返回 raw inner product 等“越大越好”的分数时使用 `desc`。
 
 ### 3.12 `pg_retrieval_engine_rerank`
 
@@ -328,9 +338,30 @@ pg_retrieval_engine_retrieval_explain(
 ) returns jsonb
 ```
 
-返回 `stage_counts`、`relevance.recalled`、`relevance.missing` 和 `likely_failure_reason`。v1 reason 包含 `no_final_results`、`no_relevance_labels`、`fully_recalled`、`fusion_or_rerank_drop`、`candidate_generation_miss`。
+返回 `stage_counts`、候选重叠、过滤诊断、可选 latency hints、`relevance.recalled`、`relevance.missing` 和 `likely_failure_reason`。v1 reason 包含 `no_final_results`、`no_relevance_labels`、`fully_recalled`、`fusion_or_rerank_drop`、`candidate_generation_miss`。
 
-### 3.14 `pg_retrieval_engine_index_autotune`
+### 3.14 `pg_retrieval_engine_hybrid_autotune`
+
+```sql
+pg_retrieval_engine_hybrid_autotune(
+  mode text default 'balanced',
+  k int default 10,
+  options jsonb default '{}'::jsonb
+) returns jsonb
+```
+
+返回 `vector_k`、`fts_k`、`rrf_k`、可选 `rerank_k` 以及 pgvector runtime 参数的启发式推荐。输出只是起点，必须用固定 qrels 和 P95/P99 latency 复测。
+
+支持 `mode`：`latency` / `balanced` / `recall`。
+
+支持 `options`：
+
+- `target_recall`，默认 `0.90`
+- `target_p95_ms`，可选
+- `max_candidate_k`，默认 `1000`
+- `vector_weight`、`fts_weight`
+
+### 3.15 `pg_retrieval_engine_index_autotune`
 
 ```sql
 pg_retrieval_engine_index_autotune(
@@ -350,7 +381,7 @@ pg_retrieval_engine_index_autotune(
 
 返回：包含 `hnsw_ef_search` / `ivf_nprobe` / `preferred_batch_size` 的 old/new 对比。
 
-### 3.15 `pg_retrieval_engine_metrics_reset`
+### 3.16 `pg_retrieval_engine_metrics_reset`
 
 ```sql
 pg_retrieval_engine_metrics_reset(name text default null) returns void
@@ -359,7 +390,7 @@ pg_retrieval_engine_metrics_reset(name text default null) returns void
 - `name is null`：重置当前 backend 全部索引 runtime 指标。
 - `name not null`：只重置目标索引 runtime 指标。
 
-### 3.16 `pg_retrieval_engine_index_save`
+### 3.17 `pg_retrieval_engine_index_save`
 
 ```sql
 pg_retrieval_engine_index_save(name text, path text) returns void
@@ -368,7 +399,7 @@ pg_retrieval_engine_index_save(name text, path text) returns void
 - 主索引写到 `path`
 - 元数据写到 `path.meta`
 
-### 3.17 `pg_retrieval_engine_index_load`
+### 3.18 `pg_retrieval_engine_index_load`
 
 ```sql
 pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') returns void
@@ -376,7 +407,7 @@ pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') 
 
 - 将磁盘索引加载为新索引名。
 
-### 3.18 `pg_retrieval_engine_index_stats`
+### 3.19 `pg_retrieval_engine_index_stats`
 
 ```sql
 pg_retrieval_engine_index_stats(name text) returns jsonb
@@ -388,13 +419,13 @@ pg_retrieval_engine_index_stats(name text) returns jsonb
 - 参数：`hnsw/ivf/ivfpq`
 - 运行指标：`runtime.*`（调用量、耗时、候选深度、batch 参数、autotune 状态等）
 
-### 3.19 `pg_retrieval_engine_index_drop`
+### 3.20 `pg_retrieval_engine_index_drop`
 
 ```sql
 pg_retrieval_engine_index_drop(name text) returns void
 ```
 
-### 3.20 `pg_retrieval_engine_reset`
+### 3.21 `pg_retrieval_engine_reset`
 
 ```sql
 pg_retrieval_engine_reset() returns void

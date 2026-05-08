@@ -12,5 +12,13 @@
 --   '[0.1,0.2,0.3]'::vector,
 --   plainto_tsquery('english', 'vector database'),
 --   10,
---   '{"vector_k":50,"fts_k":50,"rrf_k":60,"vector_operator":"<=>"}'::jsonb
+--   '{
+--      "vector_k": 50,
+--      "fts_k": 50,
+--      "rrf_k": 60,
+--      "vector_operator": "<=>",
+--      "filters": {"tenant_id": "acme"},
+--      "metadata_filter": {"doc_type": "manual"},
+--      "soft_delete_column": "deleted_at"
+--    }'::jsonb
 -- );

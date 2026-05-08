@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-`pg_retrieval_engine` is a PostgreSQL hybrid retrieval extension. It combines vector retrieval, full-text retrieval, ranking fusion, evaluation, and observability inside PostgreSQL. The current version uses FAISS as the high-performance ANN execution engine, reuses pgvector's `vector` type, uses PostgreSQL `tsvector` for full-text retrieval, and fuses dense/sparse rankings with RRF.
+`pg_retrieval_engine` is a PostgreSQL-native high-performance hybrid search engine. The production-consistent path uses pgvector for dense retrieval, PostgreSQL `tsvector` / GIN for sparse retrieval, and SQL RRF for dense+sparse fusion. FAISS is kept as an optional candidate accelerator and benchmark path; results from FAISS should be joined back to PostgreSQL rows for visibility, filtering, and freshness checks.
 
 ## 1. Project Scope
 
@@ -10,18 +10,22 @@ English | [中文](README.zh.md)
 
 | Capability | Status | Description |
 |---|---|---|
-| FAISS in PostgreSQL | implemented | Create, train, add, and search FAISS indexes inside a PostgreSQL backend |
-| Vector retrieval API | implemented | Supports `hnsw`, `ivfflat`, `ivfpq`; metrics: `l2`, `ip`, `cosine` |
+| pgvector hybrid search | implemented | Production-consistent dense path with pgvector HNSW / IVFFlat plus PostgreSQL `tsvector` |
+| FAISS in PostgreSQL | optional accelerator | Create, train, add, and search backend-local FAISS indexes for candidate acceleration and benchmarks |
+| FAISS runtime API | implemented | Supports `hnsw`, `ivfflat`, `ivfpq`; metrics: `l2`, `ip`, `cosine` |
 | Batch search optimization | implemented | Uses `batch_size` chunking to bound memory for large query batches |
 | Filtered retrieval | implemented | Filters ANN candidates by a `filter_ids` allow-list |
 | Document ingest and chunking | implemented v1 | Registers multi-source extracted text, structured chunks, parent-child chunks, metadata/citation metadata |
 | Embedding versions and incremental queue | implemented v1 | Tracks embedding model versions and queues changed chunks by content hash |
 | pgvector index management | implemented v1 | Creates `pgvector` HNSW / IVFFlat indexes |
 | RRF fusion | implemented | Fuses pgvector rankings with PostgreSQL `tsvector` full-text rankings |
-| FAISS + FTS retrieval | implemented v1 | Runs FAISS dense and `tsvector` sparse retrieval before RRF |
+| Metadata and row filters | implemented v1 | Applies scalar filters, JSONB metadata filters, soft-delete filters, and FAISS row rechecks |
+| FAISS + FTS retrieval | implemented v1 | Runs FAISS dense and `tsvector` sparse retrieval before RRF with PostgreSQL row recheck |
 | Observability | implemented | Exposes runtime counters, timings, and latest query knobs |
-| Autotune | implemented | Updates defaults in `latency`, `balanced`, and `recall` modes |
+| Autotune | implemented | Recommends hybrid knobs in `latency`, `balanced`, and `recall` modes; FAISS runtime has separate defaults tuning |
 | Offline evaluation | implemented | Computes Recall@K, NDCG@K, P95/P99 latency |
+| Search tool API | implemented v1 | Thin Python wrapper for apps or agents to call the hybrid search function |
+| Benchmark runner | implemented v1 | Generates dense/FTS/RRF/rerank/FAISS comparison reports from exported run files |
 | Rerank v1 | implemented | Reranks candidates with external cross-encoder, LLM, or rule-based scores and citation metadata |
 | Retrieval explain | implemented v1 | Reports stage counts, overlap, and likely failure reason |
 | disk graph | planned | Disk-oriented vector graph retrieval for larger datasets |
@@ -114,7 +118,7 @@ CREATE EXTENSION pg_retrieval_engine;
 
 ## 3. Usage Entry Points
 
-Vector index:
+Optional FAISS runtime index:
 
 ```sql
 SELECT pg_retrieval_engine_index_create(
@@ -124,7 +128,7 @@ SELECT pg_retrieval_engine_index_create(
 );
 ```
 
-RRF fusion:
+Primary pgvector + full-text RRF fusion:
 
 ```sql
 SELECT *
@@ -140,6 +144,44 @@ FROM pg_retrieval_engine_hybrid_search(
 );
 ```
 
+Filtered hybrid search:
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{
+     "vector_k": 100,
+     "fts_k": 100,
+     "filters": {"tenant_id": "acme"},
+     "metadata_filter": {"doc_type": "manual"},
+     "soft_delete_column": "deleted_at"
+   }'::jsonb
+);
+```
+
+Optional FAISS accelerator:
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search_faiss(
+  'documents'::regclass,
+  'id',
+  'search_vector',
+  'docs_hnsw',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{"vector_k":100,"fts_k":100,"filters":{"tenant_id":"acme"}}'::jsonb
+);
+```
+
 Offline evaluation:
 
 ```bash
@@ -149,6 +191,20 @@ python3 evals/run_eval.py \
   --run results/fts.jsonl \
   --run results/rrf.jsonl \
   --ks 10,20,100
+```
+
+Benchmark report:
+
+```bash
+python3 bench/run_bench.py \
+  --qrels evals/qrels.tsv \
+  --run dense=results/dense.jsonl \
+  --run fts=results/fts.jsonl \
+  --run rrf=results/rrf.jsonl \
+  --run rerank=results/rerank.jsonl \
+  --run faiss=results/faiss.jsonl \
+  --ks 10,20 \
+  --output results/benchmark.md
 ```
 
 ## 4. Documentation

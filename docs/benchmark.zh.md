@@ -23,6 +23,8 @@ RRF 实验必须在同一 query set 和 qrels 下同时报告 vector-only、FTS-
 | 可观测性/自动调参 | [benchmark/observability-autotune.zh.md](benchmark/observability-autotune.zh.md) |
 | 后续模块 | [benchmark/future-modules.zh.md](benchmark/future-modules.zh.md) |
 
+Runner 文档：[benchmark-runner.zh.md](benchmark-runner.zh.md)。
+
 ## 离线评测
 
 ```bash
@@ -32,6 +34,20 @@ python3 evals/run_eval.py \
   --run results/fts.jsonl \
   --run results/rrf.jsonl \
   --ks 10,20,100
+```
+
+生成 Markdown 对比报告：
+
+```bash
+python3 bench/run_bench.py \
+  --qrels evals/qrels.tsv \
+  --run dense=results/dense.jsonl \
+  --run fts=results/fts.jsonl \
+  --run rrf=results/rrf.jsonl \
+  --run rerank=results/rerank.jsonl \
+  --run faiss=results/faiss.jsonl \
+  --ks 10,20 \
+  --output results/benchmark.md
 ```
 
 run JSONL 格式：

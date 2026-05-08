@@ -23,6 +23,8 @@ RRF experiments must report vector-only, FTS-only, and RRF results on the same q
 | Observability/autotune | [benchmark/observability-autotune.md](benchmark/observability-autotune.md) |
 | Future modules | [benchmark/future-modules.md](benchmark/future-modules.md) |
 
+Runner documentation: [benchmark-runner.md](benchmark-runner.md).
+
 ## Offline Evaluation
 
 ```bash
@@ -32,6 +34,20 @@ python3 evals/run_eval.py \
   --run results/fts.jsonl \
   --run results/rrf.jsonl \
   --ks 10,20,100
+```
+
+To generate a Markdown comparison report:
+
+```bash
+python3 bench/run_bench.py \
+  --qrels evals/qrels.tsv \
+  --run dense=results/dense.jsonl \
+  --run fts=results/fts.jsonl \
+  --run rrf=results/rrf.jsonl \
+  --run rerank=results/rerank.jsonl \
+  --run faiss=results/faiss.jsonl \
+  --ks 10,20 \
+  --output results/benchmark.md
 ```
 
 Run JSONL format:

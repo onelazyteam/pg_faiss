@@ -2,7 +2,8 @@
 
 ## 1. Global Notes
 
-- Index objects are backend-local (not globally shared across sessions).
+- pgvector and PostgreSQL tables are the production-consistent source of truth.
+- FAISS index objects are backend-local optional accelerators and are not globally shared across sessions.
 - Input types are provided by `pgvector`: `vector` / `vector[]`.
 - `metric='cosine'` is implemented as normalized inner product; returned distance is `1 - ip`.
 - Effective return count is always `min(k, ntotal)`.
@@ -30,8 +31,9 @@
 | `pg_retrieval_engine_hybrid_search_faiss` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | FAISS + `tsvector` RRF hybrid search |
 | `pg_retrieval_engine_rerank` | `table(id, final_score, base_rank, base_score, cross_encoder_score, llm_score, rule_score, diagnostics)` | Rerank candidates with external model/rule scores |
 | `pg_retrieval_engine_rerank_with_citations` | `table(..., citation, diagnostics)` | Rerank candidates with citation metadata |
-| `pg_retrieval_engine_retrieval_explain` | `jsonb` | Report stage counts and likely failure reason |
-| `pg_retrieval_engine_index_autotune` | `jsonb` | Auto tune defaults |
+| `pg_retrieval_engine_retrieval_explain` | `jsonb` | Report stage counts, filters, fusion diagnostics, and likely failure reason |
+| `pg_retrieval_engine_hybrid_autotune` | `jsonb` | Recommend hybrid search knobs for latency/balanced/recall modes |
+| `pg_retrieval_engine_index_autotune` | `jsonb` | Auto tune FAISS runtime defaults |
 | `pg_retrieval_engine_metrics_reset` | `void` | Reset runtime counters |
 | `pg_retrieval_engine_index_save` | `void` | Persist index |
 | `pg_retrieval_engine_index_load` | `void` | Load index |
@@ -227,6 +229,10 @@ Supported `options`:
 - `vector_operator`: `<=>` (default, cosine distance) / `<->` (L2) / `<#>` (negative inner product)
 - `rank_function`: `ts_rank_cd` (default) / `ts_rank`
 - `normalization`: full-text rank normalization, default `32`
+- `filters`: scalar column equality filters, for example `{"tenant_id":"acme"}`
+- `metadata_column`: JSONB metadata column name, default `metadata`
+- `metadata_filter`: JSONB containment filter applied as `metadata_column @> metadata_filter`
+- `soft_delete_column`: nullable timestamp/marker column that must be `NULL`
 
 ### 3.11 `pg_retrieval_engine_hybrid_search_faiss`
 
@@ -243,7 +249,11 @@ pg_retrieval_engine_hybrid_search_faiss(
 ) returns table(id bigint, rrf_score double precision, vector_rank int, fts_rank int, vector_distance real, fts_score real)
 ```
 
-Runs FAISS dense retrieval and PostgreSQL `tsvector` sparse retrieval, then fuses both paths with RRF inside PostgreSQL.
+Runs FAISS dense retrieval and PostgreSQL `tsvector` sparse retrieval, joins FAISS candidate IDs back to the target table for row recheck and filters, then fuses both paths with RRF inside PostgreSQL.
+
+It supports the same filter options as `pg_retrieval_engine_hybrid_search`. Additional option:
+
+- `faiss_distance_order`: `asc` (default) or `desc`; use `desc` when a FAISS path returns larger-is-better scores such as raw inner product.
 
 ### 3.12 `pg_retrieval_engine_rerank`
 
@@ -305,9 +315,30 @@ pg_retrieval_engine_retrieval_explain(
 ) returns jsonb
 ```
 
-Returns stage counts, recalled/missing relevant IDs, and `likely_failure_reason`.
+Returns stage counts, candidate overlap, filter diagnostics, optional latency hints, recalled/missing relevant IDs, and `likely_failure_reason`.
 
-### 3.14 `pg_retrieval_engine_index_autotune`
+### 3.14 `pg_retrieval_engine_hybrid_autotune`
+
+```sql
+pg_retrieval_engine_hybrid_autotune(
+  mode text default 'balanced',
+  k int default 10,
+  options jsonb default '{}'::jsonb
+) returns jsonb
+```
+
+Returns heuristic recommendations for `vector_k`, `fts_k`, `rrf_k`, optional `rerank_k`, and pgvector runtime knobs. Treat the output as a starting point and validate it with fixed qrels and P95/P99 latency measurements.
+
+Supported `mode`: `latency` / `balanced` / `recall`.
+
+Supported `options`:
+
+- `target_recall`, default `0.90`
+- `target_p95_ms`, optional
+- `max_candidate_k`, default `1000`
+- `vector_weight`, `fts_weight`
+
+### 3.15 `pg_retrieval_engine_index_autotune`
 
 ```sql
 pg_retrieval_engine_index_autotune(
@@ -327,7 +358,7 @@ Arguments:
 
 Returns JSON old/new diffs for `hnsw_ef_search`, `ivf_nprobe`, and `preferred_batch_size`.
 
-### 3.15 `pg_retrieval_engine_metrics_reset`
+### 3.16 `pg_retrieval_engine_metrics_reset`
 
 ```sql
 pg_retrieval_engine_metrics_reset(name text default null) returns void
@@ -336,7 +367,7 @@ pg_retrieval_engine_metrics_reset(name text default null) returns void
 - `name is null`: reset runtime counters for all indexes in current backend.
 - `name is not null`: reset only the target index.
 
-### 3.16 `pg_retrieval_engine_index_save`
+### 3.17 `pg_retrieval_engine_index_save`
 
 ```sql
 pg_retrieval_engine_index_save(name text, path text) returns void
@@ -345,7 +376,7 @@ pg_retrieval_engine_index_save(name text, path text) returns void
 - Main index file: `path`
 - Sidecar metadata: `path.meta`
 
-### 3.17 `pg_retrieval_engine_index_load`
+### 3.18 `pg_retrieval_engine_index_load`
 
 ```sql
 pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') returns void
@@ -353,7 +384,7 @@ pg_retrieval_engine_index_load(name text, path text, device text default 'cpu') 
 
 Loads a persisted index under a new runtime name.
 
-### 3.18 `pg_retrieval_engine_index_stats`
+### 3.19 `pg_retrieval_engine_index_stats`
 
 ```sql
 pg_retrieval_engine_index_stats(name text) returns jsonb
@@ -365,13 +396,13 @@ Returns:
 - Config snapshots: `hnsw/ivf/ivfpq`
 - Runtime metrics: `runtime.*` (call counts, timing totals/averages, latest candidate/batch knobs, autotune state)
 
-### 3.19 `pg_retrieval_engine_index_drop`
+### 3.20 `pg_retrieval_engine_index_drop`
 
 ```sql
 pg_retrieval_engine_index_drop(name text) returns void
 ```
 
-### 3.20 `pg_retrieval_engine_reset`
+### 3.21 `pg_retrieval_engine_reset`
 
 ```sql
 pg_retrieval_engine_reset() returns void

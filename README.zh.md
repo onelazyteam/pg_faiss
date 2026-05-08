@@ -2,7 +2,7 @@
 
 中文 | [English](README.md)
 
-`pg_retrieval_engine` 是一个面向 PostgreSQL 的混合检索扩展，目标是在数据库内组合向量检索、全文检索、融合排序、评测与可观测能力。当前版本以 FAISS 作为高性能 ANN 执行引擎，复用 pgvector 的 `vector` 类型，并通过 PostgreSQL 原生 `tsvector` 支持全文检索，再用 RRF 将 dense/sparse 结果融合。
+`pg_retrieval_engine` 是一个 PostgreSQL 原生高性能混合检索引擎。生产一致性主路径使用 pgvector 做 dense 向量召回，使用 PostgreSQL `tsvector` / GIN 做 sparse 全文召回，并用 SQL RRF 融合 dense+sparse 排名。FAISS 保留为可选候选加速器和 benchmark 路径；FAISS 返回的结果应回表校验 PostgreSQL 行可见性、过滤条件和数据新鲜度。
 
 ## 1. 项目内容
 
@@ -12,18 +12,22 @@
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| FAISS in PostgreSQL | 已实现 | 在 PostgreSQL backend 内创建、训练、写入、查询 FAISS 索引 |
-| 向量检索 API | 已实现 | 支持 `hnsw`、`ivfflat`、`ivfpq`，支持 `l2`、`ip`、`cosine` |
+| pgvector 混合检索 | 已实现 | 生产一致性 dense 主路径：pgvector HNSW / IVFFlat + PostgreSQL `tsvector` |
+| FAISS in PostgreSQL | 可选加速器 | 在 PostgreSQL backend 内创建、训练、写入、查询 FAISS 索引，用于候选加速和 benchmark |
+| FAISS runtime API | 已实现 | 支持 `hnsw`、`ivfflat`、`ivfpq`，支持 `l2`、`ip`、`cosine` |
 | 批量检索优化 | 已实现 | 通过 `batch_size` 分块执行，降低大批量查询内存峰值 |
 | 过滤检索 | 已实现 | ANN 结果按 `filter_ids` allow-list 过滤 |
 | 文档导入与 chunk | 已实现 v1 | 登记多源文本、结构化 chunk、parent-child chunk、metadata/citation metadata |
 | Embedding 版本与增量队列 | 已实现 v1 | 管理 embedding model/version，按 chunk content hash 生成增量向量化任务 |
 | pgvector 索引管理 | 已实现 v1 | 创建 `pgvector` HNSW / IVFFlat 索引 |
 | RRF 融合 | 已实现 | 融合 pgvector 排名与 PostgreSQL `tsvector` 全文检索排名 |
-| FAISS + FTS 双路召回 | 已实现 v1 | FAISS dense 与 `tsvector` sparse 双路召回后执行 RRF |
+| metadata / 行过滤 | 已实现 v1 | 支持标量过滤、JSONB metadata 过滤、软删除过滤，以及 FAISS 回表校验 |
+| FAISS + FTS 双路召回 | 已实现 v1 | FAISS dense 与 `tsvector` sparse 双路召回后执行 RRF，并执行 PostgreSQL 回表校验 |
 | 可观测性 | 已实现 | 暴露 runtime counters、耗时、最近查询参数 |
-| 自动调参 | 已实现 | `latency` / `balanced` / `recall` 模式调整搜索默认参数 |
+| 自动调参 | 已实现 | 为 hybrid search 推荐 `latency` / `balanced` / `recall` 模式参数；FAISS runtime 另有默认参数调优 |
 | 离线评测 | 已实现 | 计算 Recall@K、NDCG@K、P95/P99 latency |
+| Search tool API | 已实现 v1 | 给应用或 Agent 调用 hybrid search 的轻量 Python wrapper |
+| Benchmark runner | 已实现 v1 | 基于导出的 run 文件生成 dense/FTS/RRF/rerank/FAISS 对比报告 |
 | Rerank v1 | 已实现 | 基于外部 cross-encoder、LLM 或 rule-based 分数对候选集精排，支持 citation metadata 输出 |
 | Retrieval explain | 已实现 v1 | 输出召回阶段计数、重叠情况和 likely failure reason |
 | disk graph | 规划中 | 面向更大规模向量的磁盘图检索模块 |
@@ -116,7 +120,7 @@ CREATE EXTENSION pg_retrieval_engine;
 
 ## 3. 使用入口
 
-向量索引：
+可选 FAISS runtime 索引：
 
 ```sql
 SELECT pg_retrieval_engine_index_create(
@@ -126,7 +130,7 @@ SELECT pg_retrieval_engine_index_create(
 );
 ```
 
-RRF 融合：
+主路径 pgvector + 全文 RRF 融合：
 
 ```sql
 SELECT *
@@ -142,6 +146,44 @@ FROM pg_retrieval_engine_hybrid_search(
 );
 ```
 
+带过滤的混合检索：
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{
+     "vector_k": 100,
+     "fts_k": 100,
+     "filters": {"tenant_id": "acme"},
+     "metadata_filter": {"doc_type": "manual"},
+     "soft_delete_column": "deleted_at"
+   }'::jsonb
+);
+```
+
+可选 FAISS 候选加速：
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search_faiss(
+  'documents'::regclass,
+  'id',
+  'search_vector',
+  'docs_hnsw',
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{"vector_k":100,"fts_k":100,"filters":{"tenant_id":"acme"}}'::jsonb
+);
+```
+
 离线评测：
 
 ```bash
@@ -151,6 +193,20 @@ python3 evals/run_eval.py \
   --run results/fts.jsonl \
   --run results/rrf.jsonl \
   --ks 10,20,100
+```
+
+Benchmark 报告：
+
+```bash
+python3 bench/run_bench.py \
+  --qrels evals/qrels.tsv \
+  --run dense=results/dense.jsonl \
+  --run fts=results/fts.jsonl \
+  --run rrf=results/rrf.jsonl \
+  --run rerank=results/rerank.jsonl \
+  --run faiss=results/faiss.jsonl \
+  --ks 10,20 \
+  --output results/benchmark.md
 ```
 
 ## 4. 文档

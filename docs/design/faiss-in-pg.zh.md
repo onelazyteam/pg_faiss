@@ -2,7 +2,7 @@
 
 ## 范围
 
-`src/faiss_in_pg` 负责 backend-local 的 FAISS 运行态：
+`src/faiss_in_pg` 负责 backend-local 的 FAISS 运行态。在当前产品定位中，pgvector 是生产一致性 dense 主路径，FAISS 是可选候选加速器和 benchmark 路径：
 
 - create / train / add / search / batch search / filtered search。
 - FAISS 索引保存与加载。
@@ -12,6 +12,8 @@
 ## 执行模型
 
 索引对象保存在当前 backend 进程内的 hash table 中，key 为索引名。它不是跨 session 共享对象，也不参与 WAL 重放；调用方负责持久化业务数据，本模块负责显式写入向量后的高速检索。
+
+FAISS 结果不是 source of truth。SQL hybrid search 会把 FAISS 候选 ID join 回 PostgreSQL 行后再融合，从而应用行可见性、标量过滤、metadata 过滤与软删除校验。
 
 单查询路径会临时应用 `ef_search` / `nprobe` / `candidate_k`，执行 FAISS search，再输出 `(id, distance)`。
 

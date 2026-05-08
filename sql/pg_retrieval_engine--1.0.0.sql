@@ -664,6 +664,76 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION pg_retrieval_engine_build_filter_clause(
+    table_alias text,
+    options jsonb DEFAULT '{}'::jsonb
+) RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    opts jsonb;
+    metadata_filter jsonb;
+    metadata_column name;
+    scalar_filters jsonb;
+    filter_key text;
+    filter_value jsonb;
+    soft_delete_column name;
+    clause text := '';
+BEGIN
+    opts := COALESCE(options, '{}'::jsonb);
+
+    IF table_alias IS NULL OR table_alias !~ '^[A-Za-z_][A-Za-z0-9_]*$' THEN
+        RAISE EXCEPTION 'table_alias must be a simple SQL identifier'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    metadata_filter := COALESCE(opts->'metadata_filter', opts#>'{filters,metadata}');
+    IF metadata_filter IS NOT NULL THEN
+        IF jsonb_typeof(metadata_filter) <> 'object' THEN
+            RAISE EXCEPTION 'metadata_filter must be a JSON object'
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        IF metadata_filter <> '{}'::jsonb THEN
+            metadata_column := COALESCE(opts->>'metadata_column', 'metadata')::name;
+            clause := clause || format(' AND %I.%I @> %L::jsonb',
+                                       table_alias, metadata_column, metadata_filter::text);
+        END IF;
+    END IF;
+
+    scalar_filters := COALESCE(opts->'filters', '{}'::jsonb);
+    IF jsonb_typeof(scalar_filters) IS NOT NULL AND jsonb_typeof(scalar_filters) <> 'object' THEN
+        RAISE EXCEPTION 'filters must be a JSON object'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    FOR filter_key, filter_value IN
+        SELECT key, value
+        FROM jsonb_each(scalar_filters)
+    LOOP
+        IF filter_key = 'metadata' THEN
+            CONTINUE;
+        END IF;
+
+        IF filter_key IS NULL OR filter_key !~ '^[A-Za-z_][A-Za-z0-9_]*$' THEN
+            RAISE EXCEPTION 'filter column must be a simple SQL identifier: %', filter_key
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        clause := clause || format(' AND to_jsonb(%I.%I) = %L::jsonb',
+                                   table_alias, filter_key::name, filter_value::text);
+    END LOOP;
+
+    IF opts ? 'soft_delete_column' THEN
+        soft_delete_column := (opts->>'soft_delete_column')::name;
+        clause := clause || format(' AND %I.%I IS NULL', table_alias, soft_delete_column);
+    END IF;
+
+    RETURN clause;
+END;
+$$;
+
 CREATE FUNCTION pg_retrieval_engine_hybrid_search(
     table_name regclass,
     id_column name,
@@ -694,6 +764,7 @@ DECLARE
     vector_operator text;
     rank_function text;
     normalization integer;
+    filter_clause text;
 BEGIN
     IF k < 1 THEN
         RAISE EXCEPTION 'k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
@@ -715,6 +786,7 @@ BEGIN
     vector_operator := COALESCE(options->>'vector_operator', '<=>');
     rank_function := COALESCE(options->>'rank_function', 'ts_rank_cd');
     normalization := COALESCE((options->>'normalization')::integer, 32);
+    filter_clause := pg_retrieval_engine_build_filter_clause('d', options);
 
     IF vector_k < 1 THEN
         RAISE EXCEPTION 'vector_k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
@@ -747,22 +819,22 @@ BEGIN
     RETURN QUERY EXECUTE format($sql$
         WITH vector_results AS (
             SELECT
-                %1$I::bigint AS id,
-                (%2$I %8$s $1)::real AS vector_distance,
-                row_number() OVER (ORDER BY %2$I %8$s $1, %1$I)::integer AS vector_rank
-            FROM %3$s
-            WHERE %2$I IS NOT NULL
-            ORDER BY %2$I %8$s $1, %1$I
+                d.%1$I::bigint AS id,
+                (d.%2$I %8$s $1)::real AS vector_distance,
+                row_number() OVER (ORDER BY d.%2$I %8$s $1, d.%1$I)::integer AS vector_rank
+            FROM %3$s AS d
+            WHERE d.%2$I IS NOT NULL %11$s
+            ORDER BY d.%2$I %8$s $1, d.%1$I
             LIMIT %4$s
         ),
         fts_results AS (
             SELECT
-                %1$I::bigint AS id,
-                pg_catalog.%9$s(%5$I, $2, %10$s)::real AS fts_score,
-                row_number() OVER (ORDER BY pg_catalog.%9$s(%5$I, $2, %10$s) DESC, %1$I)::integer AS fts_rank
-            FROM %3$s
-            WHERE %5$I @@ $2
-            ORDER BY pg_catalog.%9$s(%5$I, $2, %10$s) DESC, %1$I
+                d.%1$I::bigint AS id,
+                pg_catalog.%9$s(d.%5$I, $2, %10$s)::real AS fts_score,
+                row_number() OVER (ORDER BY pg_catalog.%9$s(d.%5$I, $2, %10$s) DESC, d.%1$I)::integer AS fts_rank
+            FROM %3$s AS d
+            WHERE d.%5$I @@ $2 %11$s
+            ORDER BY pg_catalog.%9$s(d.%5$I, $2, %10$s) DESC, d.%1$I
             LIMIT %6$s
         ),
         fused AS (
@@ -799,7 +871,8 @@ BEGIN
         k,
         vector_operator,
         rank_function,
-        normalization)
+        normalization,
+        filter_clause)
     USING query_vector, query_tsquery, vector_weight, rrf_k, fts_weight;
 END;
 $$;
@@ -807,8 +880,11 @@ $$;
 COMMENT ON FUNCTION pg_retrieval_engine_rrf_fuse(bigint[], bigint[], integer, double precision, double precision, double precision)
 IS 'Fuse vector and full-text ranked ID lists with Reciprocal Rank Fusion.';
 
+COMMENT ON FUNCTION pg_retrieval_engine_build_filter_clause(text, jsonb)
+IS 'Build a safe SQL filter clause for hybrid search options. Supports scalar filters, metadata_filter, and soft_delete_column.';
+
 COMMENT ON FUNCTION pg_retrieval_engine_hybrid_search(regclass, name, name, name, vector, tsquery, integer, jsonb)
-IS 'Run pgvector and PostgreSQL tsvector retrieval over one table, then merge rankings with Reciprocal Rank Fusion.';
+IS 'Run pgvector and PostgreSQL tsvector retrieval over one table, apply optional filters, then merge rankings with Reciprocal Rank Fusion.';
 
 CREATE FUNCTION pg_retrieval_engine_hybrid_search_faiss(
     table_name regclass,
@@ -840,6 +916,8 @@ DECLARE
     rank_function text;
     normalization integer;
     search_params jsonb;
+    filter_clause text;
+    faiss_distance_order text;
 BEGIN
     IF k < 1 THEN
         RAISE EXCEPTION 'k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
@@ -861,6 +939,8 @@ BEGIN
     rank_function := COALESCE(options->>'rank_function', 'ts_rank_cd');
     normalization := COALESCE((options->>'normalization')::integer, 32);
     search_params := COALESCE(options->'faiss_search_params', '{}'::jsonb);
+    filter_clause := pg_retrieval_engine_build_filter_clause('d', options);
+    faiss_distance_order := COALESCE(options->>'faiss_distance_order', 'asc');
 
     IF vector_k < 1 THEN
         RAISE EXCEPTION 'vector_k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
@@ -885,23 +965,38 @@ BEGIN
         RAISE EXCEPTION 'normalization must be in range 0..63'
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
+    IF faiss_distance_order NOT IN ('asc', 'desc') THEN
+        RAISE EXCEPTION 'faiss_distance_order must be asc or desc'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
 
     RETURN QUERY EXECUTE format($sql$
-        WITH vector_results AS (
+        WITH raw_vector_results AS (
             SELECT
                 s.id,
                 s.distance AS vector_distance,
-                row_number() OVER (ORDER BY s.distance, s.id)::integer AS vector_rank
+                row_number() OVER (ORDER BY s.distance %11$s, s.id)::integer AS raw_vector_rank
             FROM pg_retrieval_engine_index_search($1, $2, %4$s, $3) AS s
+        ),
+        vector_results AS (
+            SELECT
+                r.id,
+                r.vector_distance,
+                row_number() OVER (ORDER BY r.raw_vector_rank, r.id)::integer AS vector_rank
+            FROM raw_vector_results r
+            JOIN %3$s AS d ON d.%1$I::bigint = r.id
+            WHERE true %10$s
+            ORDER BY r.raw_vector_rank, r.id
+            LIMIT %4$s
         ),
         fts_results AS (
             SELECT
-                %1$I::bigint AS id,
-                pg_catalog.%8$s(%2$I, $4, %9$s)::real AS fts_score,
-                row_number() OVER (ORDER BY pg_catalog.%8$s(%2$I, $4, %9$s) DESC, %1$I)::integer AS fts_rank
-            FROM %3$s
-            WHERE %2$I @@ $4
-            ORDER BY pg_catalog.%8$s(%2$I, $4, %9$s) DESC, %1$I
+                d.%1$I::bigint AS id,
+                pg_catalog.%8$s(d.%2$I, $4, %9$s)::real AS fts_score,
+                row_number() OVER (ORDER BY pg_catalog.%8$s(d.%2$I, $4, %9$s) DESC, d.%1$I)::integer AS fts_rank
+            FROM %3$s AS d
+            WHERE d.%2$I @@ $4 %10$s
+            ORDER BY pg_catalog.%8$s(d.%2$I, $4, %9$s) DESC, d.%1$I
             LIMIT %5$s
         ),
         fused AS (
@@ -937,7 +1032,9 @@ BEGIN
         k,
         rrf_k,
         rank_function,
-        normalization)
+        normalization,
+        filter_clause,
+        faiss_distance_order)
     USING faiss_index_name, query_vector, search_params, query_tsquery,
           vector_weight, rrf_k, fts_weight;
 END;
@@ -1231,10 +1328,15 @@ DECLARE
     overlap_count integer;
     vector_only_count integer;
     fts_only_count integer;
+    candidate_count integer;
+    dropped_count integer;
+    overlap_ratio double precision;
     missing_relevant bigint[];
     recalled_relevant bigint[];
     reason text;
+    opts jsonb;
 BEGIN
+    opts := COALESCE(options, '{}'::jsonb);
     vector_ids := COALESCE(vector_ids, ARRAY[]::bigint[]);
     fts_ids := COALESCE(fts_ids, ARRAY[]::bigint[]);
     final_ids := COALESCE(final_ids, ARRAY[]::bigint[]);
@@ -1269,6 +1371,19 @@ BEGIN
         SELECT DISTINCT id FROM unnest(vector_ids) AS v(id)
     ) fts_only_ids;
 
+    SELECT count(*)::integer INTO candidate_count
+    FROM (
+        SELECT DISTINCT id FROM unnest(vector_ids) AS v(id)
+        UNION
+        SELECT DISTINCT id FROM unnest(fts_ids) AS f(id)
+    ) candidate_ids;
+
+    dropped_count := GREATEST(candidate_count - final_count, 0);
+    overlap_ratio := CASE WHEN candidate_count > 0
+                          THEN overlap_count::double precision / candidate_count::double precision
+                          ELSE 0.0
+                     END;
+
     IF relevant_ids IS NULL THEN
         missing_relevant := NULL;
         recalled_relevant := NULL;
@@ -1302,16 +1417,142 @@ BEGIN
             'vector', vector_count,
             'fts', fts_count,
             'final', final_count,
+            'candidate', candidate_count,
             'overlap', overlap_count,
             'vector_only', vector_only_count,
-            'fts_only', fts_only_count
+            'fts_only', fts_only_count,
+            'dropped_after_candidate_generation', dropped_count
+        ),
+        'fusion', jsonb_build_object(
+            'method', COALESCE(opts->>'fusion_method', 'rrf'),
+            'rrf_k', COALESCE(opts->'rrf_k', '60'::jsonb),
+            'vector_weight', COALESCE(opts->'vector_weight', opts->'dense_weight', '1.0'::jsonb),
+            'fts_weight', COALESCE(opts->'fts_weight', opts->'sparse_weight', '1.0'::jsonb),
+            'overlap_ratio', overlap_ratio
+        ),
+        'filters', jsonb_build_object(
+            'scalar', COALESCE(opts->'filters', '{}'::jsonb),
+            'metadata_filter', COALESCE(opts->'metadata_filter', opts#>'{filters,metadata}', '{}'::jsonb),
+            'soft_delete_column', opts->>'soft_delete_column'
+        ),
+        'latency_ms', COALESCE(opts->'latency_ms', '{}'::jsonb),
+        'candidates', jsonb_build_object(
+            'vector_ids', vector_ids,
+            'fts_ids', fts_ids,
+            'final_ids', final_ids
         ),
         'relevance', jsonb_build_object(
             'recalled', recalled_relevant,
             'missing', missing_relevant
         ),
         'likely_failure_reason', reason,
-        'options', COALESCE(options, '{}'::jsonb)
+        'options', opts
+    );
+END;
+$$;
+
+CREATE FUNCTION pg_retrieval_engine_hybrid_autotune(
+    mode text DEFAULT 'balanced',
+    k integer DEFAULT 10,
+    options jsonb DEFAULT '{}'::jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    opts jsonb;
+    mode_norm text;
+    target_recall double precision;
+    target_p95_ms double precision;
+    max_candidate_k integer;
+    multiplier integer;
+    recommended_vector_k integer;
+    recommended_fts_k integer;
+    recommended_rerank_k integer;
+    recommended_rrf_k integer;
+    hnsw_ef_search integer;
+    ivfflat_probes integer;
+BEGIN
+    opts := COALESCE(options, '{}'::jsonb);
+    mode_norm := lower(COALESCE(mode, 'balanced'));
+
+    IF mode_norm NOT IN ('latency', 'balanced', 'recall') THEN
+        RAISE EXCEPTION 'mode must be latency, balanced, or recall'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF k < 1 THEN
+        RAISE EXCEPTION 'k must be >= 1' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    target_recall := COALESCE((opts->>'target_recall')::double precision, 0.90);
+    target_p95_ms := COALESCE((opts->>'target_p95_ms')::double precision, NULL);
+    max_candidate_k := COALESCE((opts->>'max_candidate_k')::integer, 1000);
+
+    IF target_recall <= 0 OR target_recall > 1 THEN
+        RAISE EXCEPTION 'target_recall must be in range (0, 1]'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF max_candidate_k < k THEN
+        RAISE EXCEPTION 'max_candidate_k must be >= k'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF mode_norm = 'latency' THEN
+        multiplier := 4;
+        recommended_rrf_k := 40;
+        hnsw_ef_search := 40;
+        ivfflat_probes := 4;
+    ELSIF mode_norm = 'recall' THEN
+        multiplier := 16;
+        recommended_rrf_k := 80;
+        hnsw_ef_search := 128;
+        ivfflat_probes := 32;
+    ELSE
+        multiplier := 8;
+        recommended_rrf_k := 60;
+        hnsw_ef_search := 64;
+        ivfflat_probes := 10;
+    END IF;
+
+    IF target_recall >= 0.95 THEN
+        multiplier := multiplier * 2;
+        hnsw_ef_search := hnsw_ef_search * 2;
+        ivfflat_probes := ivfflat_probes * 2;
+    END IF;
+
+    IF target_p95_ms IS NOT NULL AND target_p95_ms < 50 AND mode_norm <> 'recall' THEN
+        multiplier := GREATEST(multiplier / 2, 2);
+        hnsw_ef_search := GREATEST(hnsw_ef_search / 2, 16);
+        ivfflat_probes := GREATEST(ivfflat_probes / 2, 1);
+    END IF;
+
+    recommended_vector_k := LEAST(max_candidate_k, GREATEST(k, k * multiplier));
+    recommended_fts_k := LEAST(max_candidate_k, GREATEST(k, k * multiplier));
+    recommended_rerank_k := LEAST(max_candidate_k, GREATEST(k, k * GREATEST(multiplier / 2, 2)));
+
+    RETURN jsonb_build_object(
+        'mode', mode_norm,
+        'target', jsonb_build_object(
+            'k', k,
+            'target_recall', target_recall,
+            'target_p95_ms', target_p95_ms
+        ),
+        'recommended_options', jsonb_build_object(
+            'vector_k', recommended_vector_k,
+            'fts_k', recommended_fts_k,
+            'rrf_k', recommended_rrf_k,
+            'vector_weight', COALESCE(opts->'vector_weight', '1.0'::jsonb),
+            'fts_weight', COALESCE(opts->'fts_weight', '1.0'::jsonb),
+            'rerank_k', recommended_rerank_k
+        ),
+        'pgvector_knobs', jsonb_build_object(
+            'hnsw.ef_search', hnsw_ef_search,
+            'ivfflat.probes', ivfflat_probes
+        ),
+        'notes', jsonb_build_array(
+            'Heuristic recommendation only; validate with fixed qrels and latency measurements.',
+            'Use pgvector as the production-consistent dense path; use FAISS only as an optional accelerator.'
+        )
     );
 END;
 $$;
@@ -1344,4 +1585,7 @@ COMMENT ON FUNCTION pg_retrieval_engine_rerank_with_citations(bigint[], jsonb[],
 IS 'Rerank candidate IDs and attach citation metadata aligned to the input candidate order.';
 
 COMMENT ON FUNCTION pg_retrieval_engine_retrieval_explain(bigint[], bigint[], bigint[], bigint[], jsonb)
-IS 'Summarize retrieval stage counts and likely recall failure reasons.';
+IS 'Summarize retrieval stage counts, filters, fusion diagnostics, latency hints, and likely recall failure reasons.';
+
+COMMENT ON FUNCTION pg_retrieval_engine_hybrid_autotune(text, integer, jsonb)
+IS 'Recommend pgvector hybrid search knobs for latency, balanced, or recall modes. Validate recommendations with fixed qrels.';

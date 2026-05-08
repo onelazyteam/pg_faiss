@@ -159,14 +159,17 @@ FROM pg_retrieval_engine_rrf_fuse(
 CREATE TABLE rrf_docs (
     id bigint PRIMARY KEY,
     embedding vector(4),
-    search_vector tsvector
+    search_vector tsvector,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    tenant_id text NOT NULL DEFAULT 'default',
+    deleted_at timestamptz
 );
 
 INSERT INTO rrf_docs VALUES
-    (1, '[1,0,0,0]'::vector, to_tsvector('simple', 'apple database vector')),
-    (2, '[0.9,0.1,0,0]'::vector, to_tsvector('simple', 'apple search ranking')),
-    (3, '[0,1,0,0]'::vector, to_tsvector('simple', 'banana text search')),
-    (4, '[0,0,1,0]'::vector, to_tsvector('simple', 'apple apple full text'));
+    (1, '[1,0,0,0]'::vector, to_tsvector('simple', 'apple database vector'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', NULL),
+    (2, '[0.9,0.1,0,0]'::vector, to_tsvector('simple', 'apple search ranking'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', NULL),
+    (3, '[0,1,0,0]'::vector, to_tsvector('simple', 'banana text search'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'beta', NULL),
+    (4, '[0,0,1,0]'::vector, to_tsvector('simple', 'apple apple full text'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', now());
 
 \pset format unaligned
 
@@ -211,6 +214,18 @@ FROM pg_retrieval_engine_hybrid_search(
 
 \pset format unaligned
 
+SELECT array_agg(id ORDER BY id) AS filtered_hybrid_ids
+FROM pg_retrieval_engine_hybrid_search(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":4,"fts_k":4,"filters":{"tenant_id":"acme"},"metadata_filter":{"doc_type":"manual"},"soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
+);
+
 SELECT count(*) AS faiss_hybrid_rows
 FROM pg_retrieval_engine_hybrid_search_faiss(
     'rrf_docs'::regclass,
@@ -221,6 +236,18 @@ FROM pg_retrieval_engine_hybrid_search_faiss(
     to_tsquery('simple', 'apple'),
     3,
     '{"vector_k":3,"fts_k":3,"rrf_k":60,"rank_function":"ts_rank","normalization":0}'::jsonb
+);
+
+SELECT count(*) AS faiss_hybrid_filtered_rows
+FROM pg_retrieval_engine_hybrid_search_faiss(
+    'rrf_docs'::regclass,
+    'id',
+    'search_vector',
+    'idx_h',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":4,"fts_k":4,"filters":{"tenant_id":"acme"},"metadata_filter":{"doc_type":"manual"},"soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
 );
 
 SELECT format('%s|%s|%s|%s', id, base_rank, round(final_score::numeric, 6), round(base_score::numeric, 6)) AS rerank_base
@@ -287,8 +314,22 @@ SELECT pg_retrieval_engine_retrieval_explain(
     ARRAY[2,3]::bigint[],
     ARRAY[2]::bigint[],
     ARRAY[1,2,4]::bigint[],
-    '{}'::jsonb
+    '{"filters":{"tenant_id":"acme"},"latency_ms":{"dense":1.0,"sparse":2.0,"fusion":0.5}}'::jsonb
 )->>'likely_failure_reason' AS explain_reason;
+
+SELECT (pg_retrieval_engine_retrieval_explain(
+    ARRAY[1,2]::bigint[],
+    ARRAY[2,3]::bigint[],
+    ARRAY[2]::bigint[],
+    NULL,
+    '{"filters":{"tenant_id":"acme"},"rrf_k":60}'::jsonb
+)->'stage_counts'->>'candidate')::int AS explain_candidate_count;
+
+SELECT (pg_retrieval_engine_hybrid_autotune(
+    'balanced',
+    10,
+    '{"target_recall":0.95,"target_p95_ms":80}'::jsonb
+)->'recommended_options'->>'vector_k')::int AS hybrid_autotune_vector_k;
 
 SELECT pg_retrieval_engine_rerank(ARRAY[1]::bigint[], 0);
 SELECT pg_retrieval_engine_rerank(ARRAY[1,2]::bigint[], 2, ARRAY[0.1]::double precision[]);
