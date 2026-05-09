@@ -302,6 +302,18 @@ FROM pg_retrieval_engine_hybrid_search(
     '{"vector_k":4,"fts_k":4,"filters":{"tenant_id":"acme"},"metadata_filter":{"doc_type":"manual"},"soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
 );
 
+SELECT array_agg(id ORDER BY id) AS metadata_op_filtered_hybrid_ids
+FROM pg_retrieval_engine_hybrid_search(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":4,"fts_k":4,"filters":{"tenant_id":"acme"},"metadata_filter":{"doc_type":{"op":"in","value":["manual","runbook"]}},"soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
+);
+
 SELECT array_agg(id ORDER BY id) AS acl_filtered_hybrid_ids
 FROM pg_retrieval_engine_hybrid_search(
     'rrf_docs'::regclass,

@@ -281,7 +281,11 @@ pg_retrieval_engine_hybrid_search(
   `{"properties":{"op":"contains","value":{"doc_type":"manual"}}}`
 - `eq`、`ne`、`in`、`contains` operator 必须包含 `value`；空值判断使用 `is_null`
 - `metadata_column`：JSONB metadata 列名，默认 `metadata`
-- `metadata_filter`：JSONB 包含过滤，执行为 `metadata_column @> metadata_filter`
+- `metadata_filter`：JSONB metadata 过滤。普通值使用包含语义，例如 `{"doc_type":"manual"}`；也支持字段级 operator 对象：
+  `{"doc_type":{"op":"in","value":["manual","runbook"]}}`、
+  `{"freshness":{"op":"ne","value":"stale"}}`、
+  `{"tags":{"op":"contains","value":["postgres"]}}`、
+  `{"deprecated":{"op":"is_null","value":true}}`
 - `acl_column`：JSONB ACL 列名，默认 `acl`
 - `acl_filter`：JSONB 包含过滤，执行为 `acl_column @> acl_filter`
 - `soft_delete_column`：软删除标记列，要求该列为 `NULL`

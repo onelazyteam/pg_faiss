@@ -62,7 +62,7 @@ chunks = retriever.retrieve_context(
     tenant_id="acme",
     namespace="postgres_runbook",
     top_k=10,
-    filters={"doc_type": "runbook"},
+    metadata_filter={"doc_type": {"op": "in", "value": ["runbook", "postgres_docs"]}},
     explain=True,
     user_id="alice",
     agent_id="dba-copilot",
@@ -80,11 +80,24 @@ chunks = retriever.retrieve_context(
   "user_id": "alice",
   "user_roles": ["dba"],
   "namespace": "postgres_runbook",
-  "sensitivity_max": "internal"
+  "sensitivity_max": "internal",
+  "metadata_filter": {
+    "doc_type": {"op": "in", "value": ["runbook", "postgres_docs"]}
+  }
 }
 ```
 
 Agent RAG 不能只按相似度召回。Tenant、user、agent、role、namespace 和 sensitivity filter 是检索契约的一部分，传给 LLM 的上下文本身就必须经过权限过滤。
+
+Agent workflow 需要同时检索多种文档类型时，可以使用 metadata operator filter：
+
+```json
+{
+  "metadata_filter": {
+    "doc_type": {"op": "in", "value": ["runbook", "postgres_docs"]}
+  }
+}
+```
 
 `explain=True` 时，每个 `ContextChunk` 会带 trace：
 

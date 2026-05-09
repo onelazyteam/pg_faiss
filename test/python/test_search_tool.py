@@ -132,6 +132,7 @@ class SearchToolTests(unittest.TestCase):
             user_roles=["dba"],
             sensitivity_max="internal",
             filters={"doc_type": "manual"},
+            metadata_filter={"doc_type": {"op": "in", "value": ["manual", "runbook"]}},
         )
 
         self.assertEqual(options["tenant_id"], "acme")
@@ -141,6 +142,7 @@ class SearchToolTests(unittest.TestCase):
         self.assertEqual(options["sensitivity_max"], "internal")
         self.assertEqual(options["filters"]["status"], "published")
         self.assertEqual(options["filters"]["doc_type"], "manual")
+        self.assertEqual(options["metadata_filter"]["doc_type"]["op"], "in")
 
     def test_agent_context_retriever_returns_chunks_with_trace(self) -> None:
         conn = FakeConnection()
@@ -161,6 +163,7 @@ class SearchToolTests(unittest.TestCase):
             agent_id="dba-copilot",
             user_roles=["dba"],
             sensitivity_max="internal",
+            metadata_filter={"doc_type": {"op": "in", "value": ["manual", "runbook"]}},
         )
 
         self.assertIsInstance(chunks[0], ContextChunk)
@@ -173,6 +176,7 @@ class SearchToolTests(unittest.TestCase):
         self.assertIn("pg_retrieval_engine_retrieval_explain", conn.cursor_obj.executions[1][0])
         search_options = conn.cursor_obj.executions[0][1][-1]
         self.assertIn('"tenant_id": "acme"', search_options)
+        self.assertIn('"metadata_filter": {"doc_type": {"op": "in"', search_options)
         self.assertIn('"agent_id": "dba-copilot"', search_options)
 
 

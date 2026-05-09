@@ -260,6 +260,7 @@ class AgentContextRetriever:
         namespace: str | None = None,
         top_k: int = 10,
         filters: dict[str, Any] | None = None,
+        metadata_filter: dict[str, Any] | None = None,
         explain: bool = False,
         *,
         user_id: str | None = None,
@@ -284,6 +285,7 @@ class AgentContextRetriever:
             allowed_roles=allowed_roles,
             sensitivity_max=sensitivity_max,
             filters=filters,
+            metadata_filter=metadata_filter,
         )
         options.setdefault("return_parent", True)
 
@@ -342,6 +344,7 @@ def build_agent_retrieval_options(
     allowed_roles: Sequence[str] | None = None,
     sensitivity_max: str | None = None,
     filters: dict[str, Any] | None = None,
+    metadata_filter: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     options = dict(default_options or {})
     scalar_filters = dict(options.get("filters") or {})
@@ -349,6 +352,10 @@ def build_agent_retrieval_options(
         scalar_filters.update(filters)
     if scalar_filters:
         options["filters"] = scalar_filters
+    if metadata_filter:
+        merged_metadata_filter = dict(options.get("metadata_filter") or {})
+        merged_metadata_filter.update(metadata_filter)
+        options["metadata_filter"] = merged_metadata_filter
 
     if tenant_id is not None:
         options["tenant_id"] = tenant_id

@@ -62,7 +62,7 @@ chunks = retriever.retrieve_context(
     tenant_id="acme",
     namespace="postgres_runbook",
     top_k=10,
-    filters={"doc_type": "runbook"},
+    metadata_filter={"doc_type": {"op": "in", "value": ["runbook", "postgres_docs"]}},
     explain=True,
     user_id="alice",
     agent_id="dba-copilot",
@@ -80,11 +80,24 @@ The generated retrieval options include:
   "user_id": "alice",
   "user_roles": ["dba"],
   "namespace": "postgres_runbook",
-  "sensitivity_max": "internal"
+  "sensitivity_max": "internal",
+  "metadata_filter": {
+    "doc_type": {"op": "in", "value": ["runbook", "postgres_docs"]}
+  }
 }
 ```
 
 Agent RAG must not retrieve by similarity alone. Tenant, user, agent, role, namespace, and sensitivity filters are part of the retrieval contract so the context passed to an LLM is already permission-aware.
+
+For Agent workflows that need multiple document types, use metadata operator filters:
+
+```json
+{
+  "metadata_filter": {
+    "doc_type": {"op": "in", "value": ["runbook", "postgres_docs"]}
+  }
+}
+```
 
 When `explain=True`, each `ContextChunk` includes a trace with:
 

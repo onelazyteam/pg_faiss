@@ -262,7 +262,11 @@ Supported `options`:
   `{"properties":{"op":"contains","value":{"doc_type":"manual"}}}`
 - operator objects must include `value` for `eq`, `ne`, `in`, and `contains`; use `is_null` for null checks
 - `metadata_column`: JSONB metadata column name, default `metadata`
-- `metadata_filter`: JSONB containment filter applied as `metadata_column @> metadata_filter`
+- `metadata_filter`: JSONB metadata filter. Plain values use containment semantics, e.g. `{"doc_type":"manual"}`. Field-level operator objects are also supported:
+  `{"doc_type":{"op":"in","value":["manual","runbook"]}}`,
+  `{"freshness":{"op":"ne","value":"stale"}}`,
+  `{"tags":{"op":"contains","value":["postgres"]}}`,
+  `{"deprecated":{"op":"is_null","value":true}}`
 - `acl_column`: JSONB ACL column name, default `acl`
 - `acl_filter`: JSONB containment filter applied as `acl_column @> acl_filter`
 - `soft_delete_column`: nullable timestamp/marker column that must be `NULL`

@@ -1098,8 +1098,68 @@ BEGIN
                 RAISE EXCEPTION 'metadata_column must be a simple SQL identifier'
                     USING ERRCODE = 'invalid_parameter_value';
             END IF;
-            clause := clause || format(' AND %I.%I @> %L::jsonb',
-                                       table_alias, metadata_column, metadata_filter::text);
+
+            FOR filter_key, filter_value IN
+                SELECT key, value
+                FROM jsonb_each(metadata_filter)
+            LOOP
+                IF filter_key IS NULL OR filter_key = '' THEN
+                    RAISE EXCEPTION 'metadata filter key must not be empty'
+                        USING ERRCODE = 'invalid_parameter_value';
+                END IF;
+
+                IF jsonb_typeof(filter_value) = 'object' AND filter_value ? 'op' THEN
+                    filter_op := lower(filter_value->>'op');
+                    op_value := filter_value->'value';
+                    IF filter_op IS NULL OR filter_op = '' THEN
+                        RAISE EXCEPTION 'metadata filter op must not be empty for key %', filter_key
+                            USING ERRCODE = 'invalid_parameter_value';
+                    END IF;
+                    IF filter_op IN ('eq', 'ne', 'in', 'contains') AND NOT (filter_value ? 'value') THEN
+                        RAISE EXCEPTION 'metadata filter op % requires value for key %', filter_op, filter_key
+                            USING ERRCODE = 'invalid_parameter_value';
+                    END IF;
+
+                    IF filter_op = 'eq' THEN
+                        clause := clause || format(' AND (%I.%I->%L) = %L::jsonb',
+                                                   table_alias, metadata_column, filter_key, op_value::text);
+                    ELSIF filter_op = 'ne' THEN
+                        clause := clause || format(' AND (%I.%I->%L) <> %L::jsonb',
+                                                   table_alias, metadata_column, filter_key, op_value::text);
+                    ELSIF filter_op = 'in' THEN
+                        IF jsonb_typeof(op_value) <> 'array' THEN
+                            RAISE EXCEPTION 'metadata in filter value must be an array for key %', filter_key
+                                USING ERRCODE = 'invalid_parameter_value';
+                        END IF;
+                        SELECT string_agg(format('%L::jsonb', elem.value::text), ', ')
+                        INTO value_list
+                        FROM jsonb_array_elements(op_value) AS elem(value);
+                        IF value_list IS NULL THEN
+                            clause := clause || ' AND false';
+                        ELSE
+                            clause := clause || format(' AND (%I.%I->%L) IN (%s)',
+                                                       table_alias, metadata_column, filter_key, value_list);
+                        END IF;
+                    ELSIF filter_op = 'contains' THEN
+                        clause := clause || format(' AND (%I.%I->%L) @> %L::jsonb',
+                                                   table_alias, metadata_column, filter_key, op_value::text);
+                    ELSIF filter_op = 'is_null' THEN
+                        IF op_value IS NULL OR op_value = 'true'::jsonb THEN
+                            clause := clause || format(' AND (%I.%I->%L) IS NULL',
+                                                       table_alias, metadata_column, filter_key);
+                        ELSE
+                            clause := clause || format(' AND (%I.%I->%L) IS NOT NULL',
+                                                       table_alias, metadata_column, filter_key);
+                        END IF;
+                    ELSE
+                        RAISE EXCEPTION 'unsupported metadata filter op for key %: %', filter_key, filter_op
+                            USING ERRCODE = 'invalid_parameter_value';
+                    END IF;
+                ELSE
+                    clause := clause || format(' AND %I.%I @> jsonb_build_object(%L, %L::jsonb)',
+                                               table_alias, metadata_column, filter_key, filter_value::text);
+                END IF;
+            END LOOP;
         END IF;
     END IF;
 
