@@ -7,7 +7,8 @@ next to the module they describe, and keep this file as the top-level map.
 
 | Module | Document | Runtime status |
 |---|---|---|
-| Document ingest, chunking, embedding queue | [design/future-modules.md](design/future-modules.md) | SQL v1 implemented |
+| Document ingest, chunking, embedding queue | [design/future-modules.md](design/future-modules.md) | SQL v2 implemented |
+| Versioned chunk embeddings | [design/future-modules.md](design/future-modules.md) | SQL v1 implemented |
 | FAISS in PostgreSQL | [design/faiss-in-pg.md](design/faiss-in-pg.md) | implemented |
 | RRF SQL fusion | [design/rrf-sql.md](design/rrf-sql.md) | implemented |
 | Evaluation metrics | [design/evaluation.md](design/evaluation.md) | implemented offline |

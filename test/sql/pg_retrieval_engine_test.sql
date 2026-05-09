@@ -23,6 +23,36 @@ FROM pg_retrieval_engine_chunk_document(
     '{"parent_chunk_size":40}'::jsonb
 );
 
+CREATE TEMP TABLE pg_retrieval_engine_chunk_ids_before AS
+SELECT array_agg(id ORDER BY chunk_type, chunk_no) AS ids
+FROM pg_retrieval_engine_chunks
+WHERE document_id = (SELECT id FROM pg_retrieval_engine_documents WHERE tenant_id = 'default' AND source_uri = 'file:///docs/retrieval.md');
+
+SELECT count(*) AS rechunk_rows
+FROM pg_retrieval_engine_chunk_document(
+    (SELECT id FROM pg_retrieval_engine_documents WHERE tenant_id = 'default' AND source_uri = 'file:///docs/retrieval.md'),
+    20,
+    5,
+    '{"parent_chunk_size":40}'::jsonb
+);
+
+SELECT (SELECT ids FROM pg_retrieval_engine_chunk_ids_before) =
+       (SELECT array_agg(id ORDER BY chunk_type, chunk_no)
+        FROM pg_retrieval_engine_chunks
+        WHERE document_id = (SELECT id FROM pg_retrieval_engine_documents WHERE tenant_id = 'default' AND source_uri = 'file:///docs/retrieval.md'))
+       AS stable_chunk_ids;
+
+DROP TABLE pg_retrieval_engine_chunk_ids_before;
+
+SELECT pg_retrieval_engine_document_upsert(
+    'file:///docs/retrieval.md',
+    'markdown',
+    'tenant specific copy',
+    '{"tenant_id":"tenant_b","acl":{"groups":["support"]}}'::jsonb,
+    'Tenant Doc'
+) <> (SELECT id FROM pg_retrieval_engine_documents WHERE tenant_id = 'default' AND source_uri = 'file:///docs/retrieval.md')
+AS tenant_scoped_source_uri_ok;
+
 SELECT pg_retrieval_engine_embedding_version_create(
     'demo-embed',
     'v1',
@@ -35,16 +65,61 @@ SELECT pg_retrieval_engine_enqueue_embedding_jobs(
     (SELECT id FROM pg_retrieval_engine_embedding_versions WHERE model_name = 'demo-embed' AND model_version = 'v1')
 ) > 0 AS embedding_jobs_enqueued;
 
+CREATE TEMP TABLE pg_retrieval_engine_claimed_jobs AS
+SELECT *
+FROM pg_retrieval_engine_claim_embedding_jobs(
+    (SELECT id FROM pg_retrieval_engine_embedding_versions WHERE model_name = 'demo-embed' AND model_version = 'v1'),
+    2,
+    'worker-a'
+);
+
+SELECT count(*) AS claimed_jobs, min(attempts) AS min_claim_attempts
+FROM pg_retrieval_engine_claimed_jobs;
+
 SELECT pg_retrieval_engine_embedding_job_complete(
-    (SELECT min(id) FROM pg_retrieval_engine_embedding_jobs),
+    (SELECT job_id FROM pg_retrieval_engine_claimed_jobs ORDER BY job_id LIMIT 1),
     '[1,0,0,0]'::vector,
-    '{"source":"regress"}'::jsonb
+    '{"source":"regress"}'::jsonb,
+    (SELECT attempts FROM pg_retrieval_engine_claimed_jobs ORDER BY job_id LIMIT 1),
+    'worker-a'
 ) IS NOT NULL AS embedding_job_complete_ok;
 
 SELECT count(*) FILTER (WHERE embedding IS NOT NULL) AS embedded_chunks,
        count(*) FILTER (WHERE status = 'done') AS done_jobs
 FROM pg_retrieval_engine_chunks c
 LEFT JOIN pg_retrieval_engine_embedding_jobs j ON j.chunk_id = c.id;
+
+SELECT count(*) AS versioned_embeddings
+FROM pg_retrieval_engine_chunk_embeddings;
+
+SELECT pg_retrieval_engine_activate_embedding_version(
+    (SELECT id FROM pg_retrieval_engine_embedding_versions WHERE model_name = 'demo-embed' AND model_version = 'v1'),
+    'default'
+) AS activated_embeddings;
+
+SELECT pg_retrieval_engine_embedding_job_fail(
+    (SELECT job_id FROM pg_retrieval_engine_claimed_jobs ORDER BY job_id OFFSET 1 LIMIT 1),
+    'model timeout',
+    '{"retryable":true}'::jsonb,
+    (SELECT attempts FROM pg_retrieval_engine_claimed_jobs ORDER BY job_id OFFSET 1 LIMIT 1),
+    'worker-a'
+) IS NOT NULL AS embedding_job_fail_ok;
+
+SELECT count(*) AS reclaimed_jobs, min(attempts) AS min_reclaimed_attempts
+FROM pg_retrieval_engine_claim_embedding_jobs(
+    (SELECT id FROM pg_retrieval_engine_embedding_versions WHERE model_name = 'demo-embed' AND model_version = 'v1'),
+    1,
+    'worker-b'
+);
+
+SELECT count(*) > 0 AS search_chunks_ok,
+       bool_or(context_content IS NOT NULL) AS search_chunks_context_ok
+FROM pg_retrieval_engine_search_chunks(
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'alpha'),
+    2,
+    '{"tenant_id":"default","return_parent":true}'::jsonb
+);
 
 \pset format aligned
 
@@ -161,15 +236,16 @@ CREATE TABLE rrf_docs (
     embedding vector(4),
     search_vector tsvector,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    acl jsonb NOT NULL DEFAULT '{}'::jsonb,
     tenant_id text NOT NULL DEFAULT 'default',
     deleted_at timestamptz
 );
 
 INSERT INTO rrf_docs VALUES
-    (1, '[1,0,0,0]'::vector, to_tsvector('simple', 'apple database vector'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', NULL),
-    (2, '[0.9,0.1,0,0]'::vector, to_tsvector('simple', 'apple search ranking'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', NULL),
-    (3, '[0,1,0,0]'::vector, to_tsvector('simple', 'banana text search'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'beta', NULL),
-    (4, '[0,0,1,0]'::vector, to_tsvector('simple', 'apple apple full text'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', now());
+    (1, '[1,0,0,0]'::vector, to_tsvector('simple', 'apple database vector'), '{"doc_type":"manual","lang":"en","namespace":"postgres_runbook","sensitivity_level":"internal"}'::jsonb, '{"groups":["support"],"roles":["dba"],"agents":["dba-copilot"],"users":["alice"]}'::jsonb, 'acme', NULL),
+    (2, '[0.9,0.1,0,0]'::vector, to_tsvector('simple', 'apple search ranking'), '{"doc_type":"manual","lang":"en","namespace":"postgres_runbook","sensitivity_level":"confidential"}'::jsonb, '{"groups":["eng"],"roles":["eng"],"agents":["dba-copilot"]}'::jsonb, 'acme', NULL),
+    (3, '[0,1,0,0]'::vector, to_tsvector('simple', 'banana text search'), '{"doc_type":"manual","lang":"en","namespace":"postgres_runbook","sensitivity_level":"internal"}'::jsonb, '{"groups":["support"],"roles":["dba"],"agents":["dba-copilot"]}'::jsonb, 'beta', NULL),
+    (4, '[0,0,1,0]'::vector, to_tsvector('simple', 'apple apple full text'), '{"doc_type":"manual","lang":"en","namespace":"postgres_runbook","sensitivity_level":"internal"}'::jsonb, '{"groups":["support"],"roles":["dba"],"agents":["dba-copilot"]}'::jsonb, 'acme', now());
 
 \pset format unaligned
 
@@ -225,6 +301,44 @@ FROM pg_retrieval_engine_hybrid_search(
     3,
     '{"vector_k":4,"fts_k":4,"filters":{"tenant_id":"acme"},"metadata_filter":{"doc_type":"manual"},"soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
 );
+
+SELECT array_agg(id ORDER BY id) AS acl_filtered_hybrid_ids
+FROM pg_retrieval_engine_hybrid_search(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":4,"fts_k":4,"tenant_id":"acme","acl_filter":{"groups":["support"]},"soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
+);
+
+SELECT array_agg(id ORDER BY id) AS agent_permission_ids
+FROM pg_retrieval_engine_hybrid_search(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":4,"fts_k":4,"tenant_id":"acme","agent_id":"dba-copilot","user_id":"alice","user_roles":["dba"],"namespace":"postgres_runbook","sensitivity_max":"internal","soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
+);
+
+SELECT query_no, count(*) AS batch_hybrid_rows
+FROM pg_retrieval_engine_hybrid_search_batch(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    ARRAY['[1,0,0,0]'::vector, '[0,1,0,0]'::vector]::vector[],
+    ARRAY[to_tsquery('simple', 'apple'), to_tsquery('simple', 'banana')]::tsquery[],
+    2,
+    '{"vector_k":3,"fts_k":3,"rank_function":"ts_rank","normalization":0}'::jsonb
+)
+GROUP BY query_no
+ORDER BY query_no;
 
 SELECT count(*) AS faiss_hybrid_rows
 FROM pg_retrieval_engine_hybrid_search_faiss(
@@ -339,6 +453,10 @@ SELECT pg_retrieval_engine_rerank(ARRAY[1]::bigint[], 1, NULL, NULL, NULL, NULL,
 SELECT pg_retrieval_engine_document_upsert('', 'markdown', 'x');
 SELECT pg_retrieval_engine_chunk_document(999999, 10, 0);
 SELECT pg_retrieval_engine_pgvector_index_create('rrf_docs'::regclass, 'embedding', 'bad');
+SELECT pg_retrieval_engine_embedding_job_complete(
+    (SELECT id FROM pg_retrieval_engine_embedding_jobs WHERE status = 'running' ORDER BY id LIMIT 1),
+    '[1,0,0]'::vector
+);
 
 \pset format aligned
 

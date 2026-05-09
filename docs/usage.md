@@ -64,7 +64,7 @@ SELECT pg_retrieval_engine_document_upsert(
   'file:///docs/retrieval.md',
   'markdown',
   '...',
-  '{"repo":"demo","path":"docs/retrieval.md"}'::jsonb,
+  '{"tenant_id":"acme","repo":"demo","path":"docs/retrieval.md","acl":{"groups":["support"]}}'::jsonb,
   'Retrieval Doc'
 );
 
@@ -76,11 +76,44 @@ FROM pg_retrieval_engine_chunk_document(
   '{"parent_chunk_size":3000}'::jsonb
 );
 
-SELECT pg_retrieval_engine_embedding_version_create('bge-m3', '2026-05', 1024);
+SELECT pg_retrieval_engine_embedding_version_create('demo-embed', '2026-05', 3);
 SELECT pg_retrieval_engine_enqueue_embedding_jobs(1);
+
+SELECT *
+FROM pg_retrieval_engine_claim_embedding_jobs(1, 100, 'embed-worker-1', 900, 5);
+
+WITH claimed AS (
+  SELECT *
+  FROM pg_retrieval_engine_claim_embedding_jobs(1, 1, 'embed-worker-1', 900, 5)
+)
+SELECT pg_retrieval_engine_embedding_job_complete(
+  job_id,
+  '[0.1,0.2,0.3]'::vector,
+  '{"provider":"worker"}'::jsonb,
+  attempts,
+  'embed-worker-1'
+)
+FROM claimed;
+
+-- On worker failure, record diagnostics and release the lease for retry.
+WITH claimed AS (
+  SELECT *
+  FROM pg_retrieval_engine_claim_embedding_jobs(1, 1, 'embed-worker-1', 900, 5)
+)
+SELECT pg_retrieval_engine_embedding_job_fail(
+  job_id,
+  'model timeout',
+  '{"retryable":true}'::jsonb,
+  attempts,
+  'embed-worker-1'
+)
+FROM claimed;
+
+-- Promote a validated embedding version to the latest chunk vector column.
+SELECT pg_retrieval_engine_activate_embedding_version(1, 'acme');
 ```
 
-PDF/HTML/Markdown parsing and embedding inference run in an external worker. The extension stores extracted text, chunks, metadata, citation metadata, and incremental job state.
+PDF/HTML/Markdown parsing and embedding inference run in an external worker. The extension stores tenant-scoped extracted text, stable chunks, metadata, ACL JSONB, citation metadata, versioned chunk embeddings, and incremental job state.
 
 ### 3.2 Create and insert
 
@@ -196,7 +229,64 @@ FROM pg_retrieval_engine_hybrid_search(
 );
 ```
 
-### 4.6 Rerank candidates
+Tenant, ACL, metadata, scalar filter ops, and soft-delete checks are part of the same `options` contract:
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{
+    "tenant_id": "acme",
+    "acl_filter": {"groups":["support"]},
+    "metadata_filter": {"doc_type":"manual"},
+    "filters": {"status":{"op":"in","value":["published","reviewed"]}},
+    "soft_delete_column": "deleted_at"
+  }'::jsonb
+);
+```
+
+For multiple query vectors and tsqueries:
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search_batch(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  ARRAY['[0.1,0.2,0.3]'::vector, '[0.2,0.1,0.3]'::vector]::vector[],
+  ARRAY[plainto_tsquery('simple', 'vector database'), plainto_tsquery('simple', 'hybrid search')]::tsquery[],
+  10,
+  '{"tenant_id":"acme","vector_k":100,"fts_k":100}'::jsonb
+);
+```
+
+### 4.6 Agent-ready managed chunk search
+
+```sql
+SELECT chunk_id,
+       context_content,
+       citation_metadata,
+       rrf_score,
+       vector_rank,
+       fts_rank
+FROM pg_retrieval_engine_search_chunks(
+  '[0.1,0.2,0.3]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  8,
+  '{"tenant_id":"acme","acl_filter":{"groups":["support"]},"return_parent":true}'::jsonb
+);
+```
+
+This helper searches extension-managed child chunks and returns content, optional parent context, metadata, citations, and ranking diagnostics for RAG/agent tools.
+
+### 4.7 Rerank candidates
 
 Cross-encoder scores are computed by the application or an external model service, then passed back to PostgreSQL for deterministic reranking:
 
@@ -243,7 +333,7 @@ FROM pg_retrieval_engine_rerank(
 );
 ```
 
-### 4.7 Offline evaluation
+### 4.8 Offline evaluation
 
 ```bash
 python3 evals/run_eval.py \

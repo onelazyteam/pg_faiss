@@ -64,7 +64,7 @@ SELECT pg_retrieval_engine_document_upsert(
   'file:///docs/retrieval.md',
   'markdown',
   '...',
-  '{"repo":"demo","path":"docs/retrieval.md"}'::jsonb,
+  '{"tenant_id":"acme","repo":"demo","path":"docs/retrieval.md","acl":{"groups":["support"]}}'::jsonb,
   'Retrieval Doc'
 );
 
@@ -76,11 +76,44 @@ FROM pg_retrieval_engine_chunk_document(
   '{"parent_chunk_size":3000}'::jsonb
 );
 
-SELECT pg_retrieval_engine_embedding_version_create('bge-m3', '2026-05', 1024);
+SELECT pg_retrieval_engine_embedding_version_create('demo-embed', '2026-05', 3);
 SELECT pg_retrieval_engine_enqueue_embedding_jobs(1);
+
+SELECT *
+FROM pg_retrieval_engine_claim_embedding_jobs(1, 100, 'embed-worker-1', 900, 5);
+
+WITH claimed AS (
+  SELECT *
+  FROM pg_retrieval_engine_claim_embedding_jobs(1, 1, 'embed-worker-1', 900, 5)
+)
+SELECT pg_retrieval_engine_embedding_job_complete(
+  job_id,
+  '[0.1,0.2,0.3]'::vector,
+  '{"provider":"worker"}'::jsonb,
+  attempts,
+  'embed-worker-1'
+)
+FROM claimed;
+
+-- worker 失败时记录诊断并释放租约，后续可重试。
+WITH claimed AS (
+  SELECT *
+  FROM pg_retrieval_engine_claim_embedding_jobs(1, 1, 'embed-worker-1', 900, 5)
+)
+SELECT pg_retrieval_engine_embedding_job_fail(
+  job_id,
+  'model timeout',
+  '{"retryable":true}'::jsonb,
+  attempts,
+  'embed-worker-1'
+)
+FROM claimed;
+
+-- 将已校验的 embedding 版本提升为 chunks 表上的最新检索向量。
+SELECT pg_retrieval_engine_activate_embedding_version(1, 'acme');
 ```
 
-PDF/HTML/Markdown 解析和 embedding 推理由外部 worker 完成；扩展负责存储抽取文本、chunk、metadata、citation metadata 和增量任务状态。
+PDF/HTML/Markdown 解析和 embedding 推理由外部 worker 完成；扩展负责存储按 tenant 隔离的抽取文本、稳定 chunk、metadata、ACL JSONB、citation metadata、版本化 chunk embedding 和增量任务状态。
 
 ### 3.2 创建与写入
 
@@ -196,7 +229,64 @@ FROM pg_retrieval_engine_hybrid_search(
 );
 ```
 
-### 4.6 候选精排
+Tenant、ACL、metadata、标量 filter op 和软删除检查都走同一个 `options` 契约：
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  '[0.1,0.2,0.3]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  20,
+  '{
+    "tenant_id": "acme",
+    "acl_filter": {"groups":["support"]},
+    "metadata_filter": {"doc_type":"manual"},
+    "filters": {"status":{"op":"in","value":["published","reviewed"]}},
+    "soft_delete_column": "deleted_at"
+  }'::jsonb
+);
+```
+
+多 query vector / tsquery 可用批量 wrapper：
+
+```sql
+SELECT *
+FROM pg_retrieval_engine_hybrid_search_batch(
+  'documents'::regclass,
+  'id',
+  'embedding',
+  'search_vector',
+  ARRAY['[0.1,0.2,0.3]'::vector, '[0.2,0.1,0.3]'::vector]::vector[],
+  ARRAY[plainto_tsquery('simple', 'vector database'), plainto_tsquery('simple', 'hybrid search')]::tsquery[],
+  10,
+  '{"tenant_id":"acme","vector_k":100,"fts_k":100}'::jsonb
+);
+```
+
+### 4.6 面向 Agent 的托管 chunk 搜索
+
+```sql
+SELECT chunk_id,
+       context_content,
+       citation_metadata,
+       rrf_score,
+       vector_rank,
+       fts_rank
+FROM pg_retrieval_engine_search_chunks(
+  '[0.1,0.2,0.3]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  8,
+  '{"tenant_id":"acme","acl_filter":{"groups":["support"]},"return_parent":true}'::jsonb
+);
+```
+
+该 helper 检索扩展托管的 child chunks，并返回 content、可选 parent context、metadata、citation 和 ranking diagnostics，方便 RAG/Agent tool 直接消费。
+
+### 4.7 候选精排
 
 Cross-encoder 分数由应用或外部模型服务计算，再传回 PostgreSQL 做确定性精排：
 
@@ -243,7 +333,7 @@ FROM pg_retrieval_engine_rerank(
 );
 ```
 
-### 4.7 离线评测
+### 4.8 离线评测
 
 ```bash
 python3 evals/run_eval.py \

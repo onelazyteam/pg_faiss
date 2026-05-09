@@ -14,12 +14,20 @@ Every retrieval experiment must report:
 
 RRF experiments must report vector-only, FTS-only, and RRF results on the same query set and qrels.
 
+Agent context retrieval experiments must also report:
+
+- Context Recall@K
+- Citation Hit Rate@K
+- Tool-use Context Hit Rate@K
+- Permission Violation Rate@K, which must be `0`
+
 ## Module Benchmark Documents
 
 | Module | Document |
 |---|---|
 | FAISS in PostgreSQL | [benchmark/faiss-in-pg.md](benchmark/faiss-in-pg.md) |
 | RRF SQL | [benchmark/rrf-sql.md](benchmark/rrf-sql.md) |
+| Agent context retrieval | [benchmark/agent-context-retrieval.md](benchmark/agent-context-retrieval.md) |
 | Observability/autotune | [benchmark/observability-autotune.md](benchmark/observability-autotune.md) |
 | Future modules | [benchmark/future-modules.md](benchmark/future-modules.md) |
 
@@ -48,6 +56,17 @@ python3 bench/run_bench.py \
   --run faiss=results/faiss.jsonl \
   --ks 10,20 \
   --output results/benchmark.md
+```
+
+Agent context retrieval benchmark:
+
+```bash
+python3 bench/run_agent_context_benchmark.py \
+  --qrels evals/agent_qrels.tsv \
+  --agent-queries evals/agent_queries.jsonl \
+  --run rrf=evals/agent_sample_run.jsonl \
+  --ks 5,10 \
+  --output results/agent_context_benchmark.md
 ```
 
 Run JSONL format:

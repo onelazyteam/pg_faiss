@@ -14,12 +14,20 @@
 
 RRF 实验必须在同一 query set 和 qrels 下同时报告 vector-only、FTS-only、RRF 三组结果。
 
+Agent context retrieval 实验还必须报告：
+
+- Context Recall@K
+- Citation Hit Rate@K
+- Tool-use Context Hit Rate@K
+- Permission Violation Rate@K，必须为 `0`
+
 ## 模块 Benchmark 文档
 
 | 模块 | 文档 |
 |---|---|
 | FAISS in PostgreSQL | [benchmark/faiss-in-pg.zh.md](benchmark/faiss-in-pg.zh.md) |
 | RRF SQL | [benchmark/rrf-sql.zh.md](benchmark/rrf-sql.zh.md) |
+| Agent context retrieval | [benchmark/agent-context-retrieval.zh.md](benchmark/agent-context-retrieval.zh.md) |
 | 可观测性/自动调参 | [benchmark/observability-autotune.zh.md](benchmark/observability-autotune.zh.md) |
 | 后续模块 | [benchmark/future-modules.zh.md](benchmark/future-modules.zh.md) |
 
@@ -48,6 +56,17 @@ python3 bench/run_bench.py \
   --run faiss=results/faiss.jsonl \
   --ks 10,20 \
   --output results/benchmark.md
+```
+
+Agent context retrieval benchmark：
+
+```bash
+python3 bench/run_agent_context_benchmark.py \
+  --qrels evals/agent_qrels.tsv \
+  --agent-queries evals/agent_queries.jsonl \
+  --run rrf=evals/agent_sample_run.jsonl \
+  --ks 5,10 \
+  --output results/agent_context_benchmark.md
 ```
 
 run JSONL 格式：

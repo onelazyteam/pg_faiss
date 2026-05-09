@@ -1,0 +1,2 @@
+{"qid":"agent-q1","method":"rrf","latency_ms":5.2,"results":[{"id":"file:///runbooks/replication-lag.md","rank":1,"score":0.91,"citation_id":"file:///runbooks/replication-lag.md","tool_context_id":"tool:check_replication_lag","permission_allowed":true}]}
+{"qid":"agent-q2","method":"rrf","latency_ms":6.4,"results":[{"id":"file:///runbooks/vacuum-bloat.md","rank":1,"score":0.88,"citation_id":"file:///runbooks/vacuum-bloat.md","tool_context_id":"tool:estimate_bloat","permission_allowed":true}]}

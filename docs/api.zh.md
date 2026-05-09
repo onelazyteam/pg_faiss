@@ -4,6 +4,8 @@
 
 - pgvector 与 PostgreSQL 业务表是生产一致性的 source of truth。
 - FAISS 索引对象是 backend-local 可选加速器，不跨 session 全局共享。
+- 扩展管理的文档以 `(tenant_id, source_uri)` 隔离；在文档 metadata 和检索 options 中传入 `"tenant_id"`。
+- ACL 以 JSONB 存储在 `acl` 字段中，检索时可通过 `acl_filter` 执行包含过滤。
 - 输入类型依赖 `pgvector`：`vector` / `vector[]`。
 - `metric='cosine'` 使用“归一化 + inner product”；返回值转换为 cosine distance（`1 - ip`）。
 - 当 `k > ntotal` 时，实际返回 `min(k, ntotal)`。
@@ -23,11 +25,16 @@
 | `pg_retrieval_engine_chunk_document` | `table(...)` | 结构化 chunk、parent-child chunk、metadata/citation metadata |
 | `pg_retrieval_engine_embedding_version_create` | `bigint` | 创建或更新 embedding 版本 |
 | `pg_retrieval_engine_enqueue_embedding_jobs` | `integer` | 按 chunk content hash 生成增量向量化任务 |
+| `pg_retrieval_engine_claim_embedding_jobs` | `table(...)` | 给外部 worker 原子租约 pending、failed 或超时 running embedding 任务 |
 | `pg_retrieval_engine_embedding_job_complete` | `void` | 写回外部 worker 生成的 embedding |
+| `pg_retrieval_engine_embedding_job_fail` | `void` | 标记 embedding job 失败并释放租约以便重试 |
+| `pg_retrieval_engine_activate_embedding_version` | `integer` | 将版本化 chunk embeddings 提升为 chunks 表上的最新向量 |
 | `pg_retrieval_engine_pgvector_index_create` | `text` | 创建 pgvector HNSW / IVFFlat 索引 |
 | `pg_retrieval_engine_tsvector_index_create` | `text` | 创建 `tsvector` GIN 索引 |
 | `pg_retrieval_engine_rrf_fuse` | `table(id, rrf_score, vector_rank, fts_rank)` | 融合两个已排序 ID 列表 |
 | `pg_retrieval_engine_hybrid_search` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | pgvector + `tsvector` RRF 混合检索 |
+| `pg_retrieval_engine_hybrid_search_batch` | `table(query_no, ...)` | pgvector + `tsvector` RRF 混合检索的批量 wrapper |
+| `pg_retrieval_engine_search_chunks` | `table(chunk_id, content, context_content, citation_metadata, ...)` | 面向 Agent/RAG 的扩展托管 chunk 搜索 |
 | `pg_retrieval_engine_hybrid_search_faiss` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | FAISS + `tsvector` RRF 混合检索 |
 | `pg_retrieval_engine_rerank` | `table(id, final_score, base_rank, base_score, cross_encoder_score, llm_score, rule_score, diagnostics)` | 基于外部模型/规则分数的候选精排 |
 | `pg_retrieval_engine_rerank_with_citations` | `table(..., citation, diagnostics)` | 精排并按候选顺序附加 citation metadata |
@@ -179,15 +186,24 @@ pg_retrieval_engine_chunk_document(
 ) returns table(chunk_id bigint, parent_chunk_id bigint, chunk_no int, chunk_type text, content text, citation_metadata jsonb)
 ```
 
-按字符窗口生成 child chunks；`options.parent_chunk_size` 大于 0 时同时生成 parent chunks。每个 chunk 记录 `metadata`、`citation_metadata`、`search_vector` 和 content hash。
+按字符窗口生成 child chunks；`options.parent_chunk_size` 大于 0 时同时生成 parent chunks。每个 chunk 记录 `tenant_id`、`metadata`、`acl`、`citation_metadata`、`search_vector` 和 content hash。
+
+`pg_retrieval_engine_document_upsert` 会读取可选的 `metadata.tenant_id` 和 `metadata.acl`；文档唯一键是 `(tenant_id, source_uri)`。Tenant ID 约束为 `^[A-Za-z0-9_.:-]{1,128}$`，保证 SQL 过滤与 worker 路径的租户表达一致。
+
+`pg_retrieval_engine_chunk_document` 使用 `(document_id, chunk_type, chunk_no)` 做稳定 upsert，不再整篇删除重插。复用同一位置时 chunk ID 保持稳定；如果内容 hash 变化，会清空 chunks 表上的最新 `embedding`，让 worker 安全重算。
 
 ```sql
 pg_retrieval_engine_embedding_version_create(model_name text, model_version text, dimensions int, distance_metric text default 'cosine', metadata jsonb default '{}'::jsonb, is_active boolean default true) returns bigint
 pg_retrieval_engine_enqueue_embedding_jobs(embedding_version_id bigint, only_changed boolean default true) returns integer
-pg_retrieval_engine_embedding_job_complete(job_id bigint, embedding vector, metadata jsonb default '{}'::jsonb) returns void
+pg_retrieval_engine_claim_embedding_jobs(embedding_version_id bigint, batch_size int default 100, worker_id text default null, lease_timeout_seconds int default 900, max_attempts int default 5) returns table(...)
+pg_retrieval_engine_embedding_job_complete(job_id bigint, embedding vector, metadata jsonb default '{}'::jsonb, expected_attempt int default null, worker_id text default null) returns void
+pg_retrieval_engine_embedding_job_fail(job_id bigint, error_message text, metadata jsonb default '{}'::jsonb, expected_attempt int default null, worker_id text default null) returns void
+pg_retrieval_engine_activate_embedding_version(embedding_version_id bigint, tenant_id text default null) returns integer
 ```
 
-Embedding worker 在 PostgreSQL 外部运行；扩展负责版本记录、增量任务队列和 embedding 写回。
+Embedding worker 在 PostgreSQL 外部运行；扩展负责版本记录、增量任务队列和 embedding 写回。`pg_retrieval_engine_claim_embedding_jobs` 使用 `FOR UPDATE SKIP LOCKED` claim pending、failed 或超时 running 任务并递增 `attempts`；它会返回当前 chunk content hash，并在 chunk 已变化时刷新 job hash。`lease_timeout_seconds` 控制租约超时，`max_attempts` 防止无限重试。
+
+`pg_retrieval_engine_embedding_job_complete` 要求 job 已被 claim 且处于 `running`，并校验可选 `expected_attempt`/`worker_id` fencing、拒绝 stale content hash、用 `vector_dims(embedding)` 校验维度，再 upsert 到 `pg_retrieval_engine_chunk_embeddings`。`pg_retrieval_engine_embedding_job_fail` 记录失败诊断，支持同样的可选 fencing，并释放租约。`pg_retrieval_engine_activate_embedding_version` 可按 embedding 版本和可选 tenant 将当前版本化 embedding 提升到 `pg_retrieval_engine_chunks.embedding`，作为生产检索路径使用。
 
 ```sql
 pg_retrieval_engine_pgvector_index_create(table_name regclass, vector_column name, index_type text, opclass text default 'vector_cosine_ops', options jsonb default '{}'::jsonb) returns text
@@ -252,10 +268,82 @@ pg_retrieval_engine_hybrid_search(
 - `vector_operator`：`<=>`（默认，cosine distance）/ `<->`（L2）/ `<#>`（negative inner product）
 - `rank_function`：`ts_rank_cd`（默认）/ `ts_rank`
 - `normalization`：全文 rank normalization，默认 `32`
+- `tenant_id`：对 `tenant_id` 列执行等值过滤
+- `namespace`：对 JSONB metadata 中的 namespace 做等值过滤，面向 Agent/RAG collection
+- `agent_id`：仅允许 ACL `agents` 缺省或包含该 agent 的行
+- `user_id`：仅允许 ACL `users` 缺省或包含该 user 的行
+- `user_roles` / `allowed_roles`：仅允许 ACL `roles` 缺省或与这些角色有交集的行
+- `sensitivity_max`：最大可访问敏感级别，取值为 `public`、`internal`、`confidential`、`restricted`
 - `filters`：标量列等值过滤，例如 `{"tenant_id":"acme"}`
+- `filters` 也支持简单 operator 对象，例如
+  `{"status":{"op":"in","value":["active","draft"]}}`、
+  `{"deleted_at":{"op":"is_null","value":true}}`、
+  `{"properties":{"op":"contains","value":{"doc_type":"manual"}}}`
+- `eq`、`ne`、`in`、`contains` operator 必须包含 `value`；空值判断使用 `is_null`
 - `metadata_column`：JSONB metadata 列名，默认 `metadata`
 - `metadata_filter`：JSONB 包含过滤，执行为 `metadata_column @> metadata_filter`
+- `acl_column`：JSONB ACL 列名，默认 `acl`
+- `acl_filter`：JSONB 包含过滤，执行为 `acl_column @> acl_filter`
 - `soft_delete_column`：软删除标记列，要求该列为 `NULL`
+
+Agent 权限感知检索应传入 top-level 权限字段，而不是只按相似度召回。例如：
+
+```json
+{
+  "tenant_id": "acme",
+  "agent_id": "dba-copilot",
+  "user_id": "alice",
+  "user_roles": ["dba"],
+  "namespace": "postgres_runbook",
+  "sensitivity_max": "internal"
+}
+```
+
+### 3.10.1 `pg_retrieval_engine_hybrid_search_batch`
+
+```sql
+pg_retrieval_engine_hybrid_search_batch(
+  table_name regclass,
+  id_column name,
+  vector_column name,
+  tsvector_column name,
+  query_vectors vector[],
+  query_tsqueries tsquery[],
+  k int,
+  options jsonb default '{}'::jsonb
+) returns table(query_no int, id bigint, rrf_score double precision, vector_rank int, fts_rank int, vector_distance real, fts_score real)
+```
+
+对多个 query vector / tsquery 执行同一套 hybrid retrieval 契约。当前实现是 `pg_retrieval_engine_hybrid_search` 的 SQL wrapper，主要用于 API 易用性和评测导出，还不是 executor 级共享优化路径。
+
+### 3.10.2 `pg_retrieval_engine_search_chunks`
+
+```sql
+pg_retrieval_engine_search_chunks(
+  query_vector vector,
+  query_tsquery tsquery,
+  k int,
+  options jsonb default '{}'::jsonb
+) returns table(
+  chunk_id bigint,
+  document_id bigint,
+  parent_chunk_id bigint,
+  chunk_type text,
+  content text,
+  context_content text,
+  metadata jsonb,
+  citation_metadata jsonb,
+  rrf_score double precision,
+  vector_rank int,
+  fts_rank int,
+  vector_distance real,
+  fts_score real
+)
+```
+
+检索 `pg_retrieval_engine_chunks`，强制 `chunk_type='child'`，并返回 content、可选 parent context、metadata、citation 和排名诊断。额外选项：
+
+- `return_parent`：为 `true` 时，若存在 parent chunk，`context_content` 返回 parent 内容；否则返回 child 内容。
 
 ### 3.11 `pg_retrieval_engine_hybrid_search_faiss`
 
@@ -339,6 +427,8 @@ pg_retrieval_engine_retrieval_explain(
 ```
 
 返回 `stage_counts`、候选重叠、过滤诊断、可选 latency hints、`relevance.recalled`、`relevance.missing` 和 `likely_failure_reason`。v1 reason 包含 `no_final_results`、`no_relevance_labels`、`fully_recalled`、`fusion_or_rerank_drop`、`candidate_generation_miss`。
+
+在 Agent debugging 中，这个输出就是 retrieval trace 的来源。Trace 页面可以展示 user query、retrieval options、dense top K、sparse top K、RRF overlap、rerank result、调用方导出的 filtered-out docs、final context 和 likely failure reason。
 
 ### 3.14 `pg_retrieval_engine_hybrid_autotune`
 

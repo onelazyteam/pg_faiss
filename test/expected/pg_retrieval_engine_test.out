@@ -29,6 +29,41 @@ FROM pg_retrieval_engine_chunk_document(
 parent_chunks|child_chunks|has_citations
 2|5|t
 (1 row)
+CREATE TEMP TABLE pg_retrieval_engine_chunk_ids_before AS
+SELECT array_agg(id ORDER BY chunk_type, chunk_no) AS ids
+FROM pg_retrieval_engine_chunks
+WHERE document_id = (SELECT id FROM pg_retrieval_engine_documents WHERE tenant_id = 'default' AND source_uri = 'file:///docs/retrieval.md');
+SELECT 1
+SELECT count(*) AS rechunk_rows
+FROM pg_retrieval_engine_chunk_document(
+    (SELECT id FROM pg_retrieval_engine_documents WHERE tenant_id = 'default' AND source_uri = 'file:///docs/retrieval.md'),
+    20,
+    5,
+    '{"parent_chunk_size":40}'::jsonb
+);
+rechunk_rows
+7
+(1 row)
+SELECT (SELECT ids FROM pg_retrieval_engine_chunk_ids_before) =
+       (SELECT array_agg(id ORDER BY chunk_type, chunk_no)
+        FROM pg_retrieval_engine_chunks
+        WHERE document_id = (SELECT id FROM pg_retrieval_engine_documents WHERE tenant_id = 'default' AND source_uri = 'file:///docs/retrieval.md'))
+       AS stable_chunk_ids;
+stable_chunk_ids
+t
+(1 row)
+DROP TABLE pg_retrieval_engine_chunk_ids_before;
+SELECT pg_retrieval_engine_document_upsert(
+    'file:///docs/retrieval.md',
+    'markdown',
+    'tenant specific copy',
+    '{"tenant_id":"tenant_b","acl":{"groups":["support"]}}'::jsonb,
+    'Tenant Doc'
+) <> (SELECT id FROM pg_retrieval_engine_documents WHERE tenant_id = 'default' AND source_uri = 'file:///docs/retrieval.md')
+AS tenant_scoped_source_uri_ok;
+tenant_scoped_source_uri_ok
+t
+(1 row)
 SELECT pg_retrieval_engine_embedding_version_create(
     'demo-embed',
     'v1',
@@ -45,10 +80,25 @@ SELECT pg_retrieval_engine_enqueue_embedding_jobs(
 embedding_jobs_enqueued
 t
 (1 row)
+CREATE TEMP TABLE pg_retrieval_engine_claimed_jobs AS
+SELECT *
+FROM pg_retrieval_engine_claim_embedding_jobs(
+    (SELECT id FROM pg_retrieval_engine_embedding_versions WHERE model_name = 'demo-embed' AND model_version = 'v1'),
+    2,
+    'worker-a'
+);
+SELECT 2
+SELECT count(*) AS claimed_jobs, min(attempts) AS min_claim_attempts
+FROM pg_retrieval_engine_claimed_jobs;
+claimed_jobs|min_claim_attempts
+2|1
+(1 row)
 SELECT pg_retrieval_engine_embedding_job_complete(
-    (SELECT min(id) FROM pg_retrieval_engine_embedding_jobs),
+    (SELECT job_id FROM pg_retrieval_engine_claimed_jobs ORDER BY job_id LIMIT 1),
     '[1,0,0,0]'::vector,
-    '{"source":"regress"}'::jsonb
+    '{"source":"regress"}'::jsonb,
+    (SELECT attempts FROM pg_retrieval_engine_claimed_jobs ORDER BY job_id LIMIT 1),
+    'worker-a'
 ) IS NOT NULL AS embedding_job_complete_ok;
 embedding_job_complete_ok
 t
@@ -59,6 +109,48 @@ FROM pg_retrieval_engine_chunks c
 LEFT JOIN pg_retrieval_engine_embedding_jobs j ON j.chunk_id = c.id;
 embedded_chunks|done_jobs
 1|1
+(1 row)
+SELECT count(*) AS versioned_embeddings
+FROM pg_retrieval_engine_chunk_embeddings;
+versioned_embeddings
+1
+(1 row)
+SELECT pg_retrieval_engine_activate_embedding_version(
+    (SELECT id FROM pg_retrieval_engine_embedding_versions WHERE model_name = 'demo-embed' AND model_version = 'v1'),
+    'default'
+) AS activated_embeddings;
+activated_embeddings
+1
+(1 row)
+SELECT pg_retrieval_engine_embedding_job_fail(
+    (SELECT job_id FROM pg_retrieval_engine_claimed_jobs ORDER BY job_id OFFSET 1 LIMIT 1),
+    'model timeout',
+    '{"retryable":true}'::jsonb,
+    (SELECT attempts FROM pg_retrieval_engine_claimed_jobs ORDER BY job_id OFFSET 1 LIMIT 1),
+    'worker-a'
+) IS NOT NULL AS embedding_job_fail_ok;
+embedding_job_fail_ok
+t
+(1 row)
+SELECT count(*) AS reclaimed_jobs, min(attempts) AS min_reclaimed_attempts
+FROM pg_retrieval_engine_claim_embedding_jobs(
+    (SELECT id FROM pg_retrieval_engine_embedding_versions WHERE model_name = 'demo-embed' AND model_version = 'v1'),
+    1,
+    'worker-b'
+);
+reclaimed_jobs|min_reclaimed_attempts
+1|2
+(1 row)
+SELECT count(*) > 0 AS search_chunks_ok,
+       bool_or(context_content IS NOT NULL) AS search_chunks_context_ok
+FROM pg_retrieval_engine_search_chunks(
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'alpha'),
+    2,
+    '{"tenant_id":"default","return_parent":true}'::jsonb
+);
+search_chunks_ok|search_chunks_context_ok
+t|t
 (1 row)
 \pset format aligned
 SELECT pg_retrieval_engine_index_create(
@@ -262,14 +354,15 @@ CREATE TABLE rrf_docs (
     embedding vector(4),
     search_vector tsvector,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    acl jsonb NOT NULL DEFAULT '{}'::jsonb,
     tenant_id text NOT NULL DEFAULT 'default',
     deleted_at timestamptz
 );
 INSERT INTO rrf_docs VALUES
-    (1, '[1,0,0,0]'::vector, to_tsvector('simple', 'apple database vector'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', NULL),
-    (2, '[0.9,0.1,0,0]'::vector, to_tsvector('simple', 'apple search ranking'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', NULL),
-    (3, '[0,1,0,0]'::vector, to_tsvector('simple', 'banana text search'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'beta', NULL),
-    (4, '[0,0,1,0]'::vector, to_tsvector('simple', 'apple apple full text'), '{"doc_type":"manual","lang":"en"}'::jsonb, 'acme', now());
+    (1, '[1,0,0,0]'::vector, to_tsvector('simple', 'apple database vector'), '{"doc_type":"manual","lang":"en","namespace":"postgres_runbook","sensitivity_level":"internal"}'::jsonb, '{"groups":["support"],"roles":["dba"],"agents":["dba-copilot"],"users":["alice"]}'::jsonb, 'acme', NULL),
+    (2, '[0.9,0.1,0,0]'::vector, to_tsvector('simple', 'apple search ranking'), '{"doc_type":"manual","lang":"en","namespace":"postgres_runbook","sensitivity_level":"confidential"}'::jsonb, '{"groups":["eng"],"roles":["eng"],"agents":["dba-copilot"]}'::jsonb, 'acme', NULL),
+    (3, '[0,1,0,0]'::vector, to_tsvector('simple', 'banana text search'), '{"doc_type":"manual","lang":"en","namespace":"postgres_runbook","sensitivity_level":"internal"}'::jsonb, '{"groups":["support"],"roles":["dba"],"agents":["dba-copilot"]}'::jsonb, 'beta', NULL),
+    (4, '[0,0,1,0]'::vector, to_tsvector('simple', 'apple apple full text'), '{"doc_type":"manual","lang":"en","namespace":"postgres_runbook","sensitivity_level":"internal"}'::jsonb, '{"groups":["support"],"roles":["dba"],"agents":["dba-copilot"]}'::jsonb, 'acme', now());
 \pset format unaligned
 SELECT pg_retrieval_engine_pgvector_index_create(
     'rrf_docs'::regclass,
@@ -336,6 +429,51 @@ FROM pg_retrieval_engine_hybrid_search(
 filtered_hybrid_ids
 {1,2}
 (1 row)
+SELECT array_agg(id ORDER BY id) AS acl_filtered_hybrid_ids
+FROM pg_retrieval_engine_hybrid_search(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":4,"fts_k":4,"tenant_id":"acme","acl_filter":{"groups":["support"]},"soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
+);
+acl_filtered_hybrid_ids
+{1}
+(1 row)
+SELECT array_agg(id ORDER BY id) AS agent_permission_ids
+FROM pg_retrieval_engine_hybrid_search(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    '[1,0,0,0]'::vector,
+    to_tsquery('simple', 'apple'),
+    3,
+    '{"vector_k":4,"fts_k":4,"tenant_id":"acme","agent_id":"dba-copilot","user_id":"alice","user_roles":["dba"],"namespace":"postgres_runbook","sensitivity_max":"internal","soft_delete_column":"deleted_at","rank_function":"ts_rank","normalization":0}'::jsonb
+);
+agent_permission_ids
+{1}
+(1 row)
+SELECT query_no, count(*) AS batch_hybrid_rows
+FROM pg_retrieval_engine_hybrid_search_batch(
+    'rrf_docs'::regclass,
+    'id',
+    'embedding',
+    'search_vector',
+    ARRAY['[1,0,0,0]'::vector, '[0,1,0,0]'::vector]::vector[],
+    ARRAY[to_tsquery('simple', 'apple'), to_tsquery('simple', 'banana')]::tsquery[],
+    2,
+    '{"vector_k":3,"fts_k":3,"rank_function":"ts_rank","normalization":0}'::jsonb
+)
+GROUP BY query_no
+ORDER BY query_no;
+query_no|batch_hybrid_rows
+1|2
+2|2
+(2 rows)
 SELECT count(*) AS faiss_hybrid_rows
 FROM pg_retrieval_engine_hybrid_search_faiss(
     'rrf_docs'::regclass,
@@ -490,13 +628,19 @@ ERROR:  score_normalization must be none or minmax
 CONTEXT:  PL/pgSQL function pg_retrieval_engine_rerank(bigint[],integer,double precision[],double precision[],double precision[],double precision[],jsonb) line 60 at RAISE
 SELECT pg_retrieval_engine_document_upsert('', 'markdown', 'x');
 ERROR:  source_uri must not be empty
-CONTEXT:  PL/pgSQL function pg_retrieval_engine_document_upsert(text,text,text,jsonb,text) line 6 at RAISE
+CONTEXT:  PL/pgSQL function pg_retrieval_engine_document_upsert(text,text,text,jsonb,text) line 17 at RAISE
 SELECT pg_retrieval_engine_chunk_document(999999, 10, 0);
 ERROR:  document does not exist
-CONTEXT:  PL/pgSQL function pg_retrieval_engine_chunk_document(bigint,integer,integer,jsonb) line 31 at RAISE
+CONTEXT:  PL/pgSQL function pg_retrieval_engine_chunk_document(bigint,integer,integer,jsonb) line 34 at RAISE
 SELECT pg_retrieval_engine_pgvector_index_create('rrf_docs'::regclass, 'embedding', 'bad');
 ERROR:  index_type must be hnsw or ivfflat
 CONTEXT:  PL/pgSQL function pg_retrieval_engine_pgvector_index_create(regclass,name,text,text,jsonb) line 7 at RAISE
+SELECT pg_retrieval_engine_embedding_job_complete(
+    (SELECT id FROM pg_retrieval_engine_embedding_jobs WHERE status = 'running' ORDER BY id LIMIT 1),
+    '[1,0,0]'::vector
+);
+ERROR:  embedding dimension mismatch: expected 4, got 3
+CONTEXT:  PL/pgSQL function pg_retrieval_engine_embedding_job_complete(bigint,vector,jsonb,integer,text) line 67 at RAISE
 \pset format aligned
 DROP TABLE rrf_docs;
 SELECT pg_retrieval_engine_index_drop('idx_h') IS NOT NULL AS drop_loaded_ok;
@@ -516,4 +660,3 @@ SELECT pg_retrieval_engine_reset() IS NOT NULL AS final_reset_ok;
 ----------------
  t
 (1 row)
-

@@ -30,8 +30,8 @@ shared across sessions and are not WAL-replayed. The caller owns durable source
 data; this module owns fast runtime search over explicitly added vectors.
 
 FAISS results are not a source of truth. SQL hybrid search joins FAISS candidate
-IDs back to PostgreSQL rows before fusion so row visibility, scalar filters,
-metadata filters, and soft-delete checks can be applied.
+IDs back to PostgreSQL rows before fusion so row visibility, tenant filters,
+ACL filters, scalar filters, metadata filters, and soft-delete checks can be applied.
 
 Single-query search applies per-call FAISS knobs, runs `index->search`, converts
 cosine scores when needed, and returns `(id, distance)`.

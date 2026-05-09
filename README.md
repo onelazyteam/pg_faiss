@@ -15,19 +15,20 @@ English | [中文](README.zh.md)
 | FAISS runtime API | implemented | Supports `hnsw`, `ivfflat`, `ivfpq`; metrics: `l2`, `ip`, `cosine` |
 | Batch search optimization | implemented | Uses `batch_size` chunking to bound memory for large query batches |
 | Filtered retrieval | implemented | Filters ANN candidates by a `filter_ids` allow-list |
-| Document ingest and chunking | implemented v1 | Registers multi-source extracted text, structured chunks, parent-child chunks, metadata/citation metadata |
-| Embedding versions and incremental queue | implemented v1 | Tracks embedding model versions and queues changed chunks by content hash |
+| Document ingest and chunking | implemented v2 | Registers tenant-scoped extracted text, stable parent-child chunks, metadata, ACL, and citation metadata |
+| Embedding versions and incremental queue | implemented v2 | Tracks embedding model versions, leases jobs with `FOR UPDATE SKIP LOCKED`, validates dimensions, and stores versioned chunk embeddings |
 | pgvector index management | implemented v1 | Creates `pgvector` HNSW / IVFFlat indexes |
 | RRF fusion | implemented | Fuses pgvector rankings with PostgreSQL `tsvector` full-text rankings |
-| Metadata and row filters | implemented v1 | Applies scalar filters, JSONB metadata filters, soft-delete filters, and FAISS row rechecks |
+| Metadata and row filters | implemented v3 | Applies tenant, user, agent, role, namespace, sensitivity, scalar, JSONB metadata/ACL, soft-delete filters, and FAISS row rechecks |
 | FAISS + FTS retrieval | implemented v1 | Runs FAISS dense and `tsvector` sparse retrieval before RRF with PostgreSQL row recheck |
 | Observability | implemented | Exposes runtime counters, timings, and latest query knobs |
 | Autotune | implemented | Recommends hybrid knobs in `latency`, `balanced`, and `recall` modes; FAISS runtime has separate defaults tuning |
 | Offline evaluation | implemented | Computes Recall@K, NDCG@K, P95/P99 latency |
-| Search tool API | implemented v1 | Thin Python wrapper for apps or agents to call the hybrid search function |
-| Benchmark runner | implemented v1 | Generates dense/FTS/RRF/rerank/FAISS comparison reports from exported run files |
+| Search tool API | implemented v3 | Thin hybrid search wrapper plus Agent Context API with context chunks, citations, scores, and traces |
+| Benchmark runner | implemented v2 | Generates dense/FTS/RRF/rerank/FAISS reports and Agent context retrieval reports with permission-violation metrics |
 | Rerank v1 | implemented | Reranks candidates with external cross-encoder, LLM, or rule-based scores and citation metadata |
 | Retrieval explain | implemented v1 | Reports stage counts, overlap, and likely failure reason |
+| Batch hybrid and chunk search | implemented v1 | Batch wrapper for pgvector/FTS RRF and agent-ready `pg_retrieval_engine_search_chunks` output |
 | disk graph | planned | Disk-oriented vector graph retrieval for larger datasets |
 
 ### 1.2 Repository Layout
@@ -159,11 +160,50 @@ FROM pg_retrieval_engine_hybrid_search(
   '{
      "vector_k": 100,
      "fts_k": 100,
+     "tenant_id": "acme",
+     "acl_filter": {"groups": ["support"]},
      "filters": {"tenant_id": "acme"},
      "metadata_filter": {"doc_type": "manual"},
      "soft_delete_column": "deleted_at"
    }'::jsonb
 );
+```
+
+Agent-ready managed chunk search:
+
+```sql
+SELECT chunk_id, context_content, citation_metadata, rrf_score
+FROM pg_retrieval_engine_search_chunks(
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  10,
+  '{"tenant_id":"acme","acl_filter":{"groups":["support"]},"return_parent":true}'::jsonb
+);
+```
+
+Agent Context API:
+
+```python
+from pg_retrieval_engine_client import AgentContextRetriever, HybridSearchConfig
+
+retriever = AgentContextRetriever(
+    connection,
+    HybridSearchConfig(table_name="pg_retrieval_engine_chunks"),
+    query_embedder=lambda text: embedding_model.embed(text),
+)
+
+chunks = retriever.retrieve_context(
+    "how should I diagnose replication lag?",
+    tenant_id="acme",
+    namespace="postgres_runbook",
+    top_k=10,
+    filters={"doc_type": "runbook"},
+    explain=True,
+    user_id="alice",
+    agent_id="dba-copilot",
+    user_roles=["dba"],
+    sensitivity_max="internal",
+)
 ```
 
 Optional FAISS accelerator:
@@ -205,6 +245,17 @@ python3 bench/run_bench.py \
   --run faiss=results/faiss.jsonl \
   --ks 10,20 \
   --output results/benchmark.md
+```
+
+Agent context benchmark:
+
+```bash
+python3 bench/run_agent_context_benchmark.py \
+  --qrels evals/agent_qrels.tsv \
+  --agent-queries evals/agent_queries.jsonl \
+  --run rrf=evals/agent_sample_run.jsonl \
+  --ks 5,10 \
+  --output results/agent_context_benchmark.md
 ```
 
 ## 4. Documentation

@@ -6,7 +6,8 @@
 
 | 模块 | 文档 | 运行状态 |
 |---|---|---|
-| 文档导入、Chunk、Embedding 队列 | [design/future-modules.zh.md](design/future-modules.zh.md) | SQL v1 已实现 |
+| 文档导入、Chunk、Embedding 队列 | [design/future-modules.zh.md](design/future-modules.zh.md) | SQL v2 已实现 |
+| 版本化 chunk embeddings | [design/future-modules.zh.md](design/future-modules.zh.md) | SQL v1 已实现 |
 | FAISS in PostgreSQL | [design/faiss-in-pg.zh.md](design/faiss-in-pg.zh.md) | 已实现 |
 | RRF SQL 融合 | [design/rrf-sql.zh.md](design/rrf-sql.zh.md) | 已实现 |
 | 评测指标 | [design/evaluation.zh.md](design/evaluation.zh.md) | 离线脚本已实现 |

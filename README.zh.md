@@ -17,19 +17,20 @@
 | FAISS runtime API | 已实现 | 支持 `hnsw`、`ivfflat`、`ivfpq`，支持 `l2`、`ip`、`cosine` |
 | 批量检索优化 | 已实现 | 通过 `batch_size` 分块执行，降低大批量查询内存峰值 |
 | 过滤检索 | 已实现 | ANN 结果按 `filter_ids` allow-list 过滤 |
-| 文档导入与 chunk | 已实现 v1 | 登记多源文本、结构化 chunk、parent-child chunk、metadata/citation metadata |
-| Embedding 版本与增量队列 | 已实现 v1 | 管理 embedding model/version，按 chunk content hash 生成增量向量化任务 |
+| 文档导入与 chunk | 已实现 v2 | 登记按 tenant 隔离的多源文本、稳定 parent-child chunk、metadata、ACL 与 citation metadata |
+| Embedding 版本与增量队列 | 已实现 v2 | 管理 embedding model/version，支持 `FOR UPDATE SKIP LOCKED` claim、维度校验和版本化 chunk embedding |
 | pgvector 索引管理 | 已实现 v1 | 创建 `pgvector` HNSW / IVFFlat 索引 |
 | RRF 融合 | 已实现 | 融合 pgvector 排名与 PostgreSQL `tsvector` 全文检索排名 |
-| metadata / 行过滤 | 已实现 v1 | 支持标量过滤、JSONB metadata 过滤、软删除过滤，以及 FAISS 回表校验 |
+| metadata / 行过滤 | 已实现 v3 | 支持 tenant、user、agent、role、namespace、sensitivity、标量、JSONB metadata/ACL、软删除过滤，以及 FAISS 回表校验 |
 | FAISS + FTS 双路召回 | 已实现 v1 | FAISS dense 与 `tsvector` sparse 双路召回后执行 RRF，并执行 PostgreSQL 回表校验 |
 | 可观测性 | 已实现 | 暴露 runtime counters、耗时、最近查询参数 |
 | 自动调参 | 已实现 | 为 hybrid search 推荐 `latency` / `balanced` / `recall` 模式参数；FAISS runtime 另有默认参数调优 |
 | 离线评测 | 已实现 | 计算 Recall@K、NDCG@K、P95/P99 latency |
-| Search tool API | 已实现 v1 | 给应用或 Agent 调用 hybrid search 的轻量 Python wrapper |
-| Benchmark runner | 已实现 v1 | 基于导出的 run 文件生成 dense/FTS/RRF/rerank/FAISS 对比报告 |
+| Search tool API | 已实现 v3 | 底层 hybrid search wrapper，以及带 context chunks、citations、scores、traces 的 Agent Context API |
+| Benchmark runner | 已实现 v2 | 生成 dense/FTS/RRF/rerank/FAISS 报告，并支持带权限违规指标的 Agent context retrieval 报告 |
 | Rerank v1 | 已实现 | 基于外部 cross-encoder、LLM 或 rule-based 分数对候选集精排，支持 citation metadata 输出 |
 | Retrieval explain | 已实现 v1 | 输出召回阶段计数、重叠情况和 likely failure reason |
+| 批量 hybrid 与 chunk search | 已实现 v1 | pgvector/FTS RRF 批量 wrapper，以及面向 Agent 的 `pg_retrieval_engine_search_chunks` 输出 |
 | disk graph | 规划中 | 面向更大规模向量的磁盘图检索模块 |
 
 ### 1.2 目录结构
@@ -161,11 +162,50 @@ FROM pg_retrieval_engine_hybrid_search(
   '{
      "vector_k": 100,
      "fts_k": 100,
+     "tenant_id": "acme",
+     "acl_filter": {"groups": ["support"]},
      "filters": {"tenant_id": "acme"},
      "metadata_filter": {"doc_type": "manual"},
      "soft_delete_column": "deleted_at"
    }'::jsonb
 );
+```
+
+面向 Agent 的托管 chunk 检索：
+
+```sql
+SELECT chunk_id, context_content, citation_metadata, rrf_score
+FROM pg_retrieval_engine_search_chunks(
+  '[0.1,0.2,0.3,0.4]'::vector,
+  plainto_tsquery('simple', 'vector database'),
+  10,
+  '{"tenant_id":"acme","acl_filter":{"groups":["support"]},"return_parent":true}'::jsonb
+);
+```
+
+Agent Context API：
+
+```python
+from pg_retrieval_engine_client import AgentContextRetriever, HybridSearchConfig
+
+retriever = AgentContextRetriever(
+    connection,
+    HybridSearchConfig(table_name="pg_retrieval_engine_chunks"),
+    query_embedder=lambda text: embedding_model.embed(text),
+)
+
+chunks = retriever.retrieve_context(
+    "how should I diagnose replication lag?",
+    tenant_id="acme",
+    namespace="postgres_runbook",
+    top_k=10,
+    filters={"doc_type": "runbook"},
+    explain=True,
+    user_id="alice",
+    agent_id="dba-copilot",
+    user_roles=["dba"],
+    sensitivity_max="internal",
+)
 ```
 
 可选 FAISS 候选加速：
@@ -207,6 +247,17 @@ python3 bench/run_bench.py \
   --run faiss=results/faiss.jsonl \
   --ks 10,20 \
   --output results/benchmark.md
+```
+
+Agent context benchmark：
+
+```bash
+python3 bench/run_agent_context_benchmark.py \
+  --qrels evals/agent_qrels.tsv \
+  --agent-queries evals/agent_queries.jsonl \
+  --run rrf=evals/agent_sample_run.jsonl \
+  --ks 5,10 \
+  --output results/agent_context_benchmark.md
 ```
 
 ## 4. 文档

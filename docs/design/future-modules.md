@@ -21,6 +21,19 @@ Target responsibility:
 - Compatibility with RRF fusion outputs.
 - Model inference does not run inside the PostgreSQL backend; the extension receives externally computed scores.
 
+## Ingest, Chunking, and Embedding Queue
+
+Status: SQL v2 implemented.
+
+Implemented responsibility:
+
+- Tenant-scoped documents keyed by `(tenant_id, source_uri)`.
+- Stable chunk upsert keyed by `(document_id, chunk_type, chunk_no)`.
+- JSONB ACL propagation from documents to chunks.
+- Claimable embedding jobs using `FOR UPDATE SKIP LOCKED`, lease timeout, max attempts, attempt/worker fencing, failure diagnostics, stale claim hash refresh, and stale content-hash rejection.
+- Versioned chunk embeddings keyed by `(chunk_id, embedding_version_id)`.
+- Explicit activation of a validated embedding version into the latest chunk vector column.
+
 ## Integration Contract
 
 Every retrieval module should be able to export:

@@ -4,3 +4,4 @@
 -- - pg_retrieval_engine_chunks
 -- - pg_retrieval_engine_embedding_versions
 -- - pg_retrieval_engine_embedding_jobs
+-- - pg_retrieval_engine_chunk_embeddings

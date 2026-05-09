@@ -4,6 +4,8 @@
 
 - pgvector and PostgreSQL tables are the production-consistent source of truth.
 - FAISS index objects are backend-local optional accelerators and are not globally shared across sessions.
+- Extension-managed documents are tenant-scoped by `(tenant_id, source_uri)`; pass `"tenant_id"` in document metadata and retrieval options.
+- ACL data is JSONB (`acl`) and can be enforced through `acl_filter`.
 - Input types are provided by `pgvector`: `vector` / `vector[]`.
 - `metric='cosine'` is implemented as normalized inner product; returned distance is `1 - ip`.
 - Effective return count is always `min(k, ntotal)`.
@@ -23,11 +25,16 @@
 | `pg_retrieval_engine_chunk_document` | `table(...)` | Structured chunks, parent-child chunks, metadata/citation metadata |
 | `pg_retrieval_engine_embedding_version_create` | `bigint` | Create/update an embedding version |
 | `pg_retrieval_engine_enqueue_embedding_jobs` | `integer` | Queue changed chunks by content hash |
+| `pg_retrieval_engine_claim_embedding_jobs` | `table(...)` | Atomically lease pending, failed, or timed-out embedding jobs for external workers |
 | `pg_retrieval_engine_embedding_job_complete` | `void` | Persist embeddings produced by an external worker |
+| `pg_retrieval_engine_embedding_job_fail` | `void` | Mark an embedding job failed and clear its lease for retry |
+| `pg_retrieval_engine_activate_embedding_version` | `integer` | Promote versioned chunk embeddings into the latest chunk vector column |
 | `pg_retrieval_engine_pgvector_index_create` | `text` | Create pgvector HNSW / IVFFlat indexes |
 | `pg_retrieval_engine_tsvector_index_create` | `text` | Create `tsvector` GIN indexes |
 | `pg_retrieval_engine_rrf_fuse` | `table(id, rrf_score, vector_rank, fts_rank)` | Fuse two ranked ID lists |
 | `pg_retrieval_engine_hybrid_search` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | pgvector + `tsvector` RRF hybrid search |
+| `pg_retrieval_engine_hybrid_search_batch` | `table(query_no, ...)` | Batch wrapper for pgvector + `tsvector` RRF hybrid search |
+| `pg_retrieval_engine_search_chunks` | `table(chunk_id, content, context_content, citation_metadata, ...)` | Agent-ready search over extension-managed chunks |
 | `pg_retrieval_engine_hybrid_search_faiss` | `table(id, rrf_score, vector_rank, fts_rank, vector_distance, fts_score)` | FAISS + `tsvector` RRF hybrid search |
 | `pg_retrieval_engine_rerank` | `table(id, final_score, base_rank, base_score, cross_encoder_score, llm_score, rule_score, diagnostics)` | Rerank candidates with external model/rule scores |
 | `pg_retrieval_engine_rerank_with_citations` | `table(..., citation, diagnostics)` | Rerank candidates with citation metadata |
@@ -163,10 +170,23 @@ pg_retrieval_engine_document_upsert(source_uri text, source_type text, content t
 pg_retrieval_engine_chunk_document(document_id bigint, chunk_size int default 1000, chunk_overlap int default 100, options jsonb default '{}'::jsonb) returns table(...)
 pg_retrieval_engine_embedding_version_create(model_name text, model_version text, dimensions int, distance_metric text default 'cosine', metadata jsonb default '{}'::jsonb, is_active boolean default true) returns bigint
 pg_retrieval_engine_enqueue_embedding_jobs(embedding_version_id bigint, only_changed boolean default true) returns integer
-pg_retrieval_engine_embedding_job_complete(job_id bigint, embedding vector, metadata jsonb default '{}'::jsonb) returns void
+pg_retrieval_engine_claim_embedding_jobs(embedding_version_id bigint, batch_size int default 100, worker_id text default null, lease_timeout_seconds int default 900, max_attempts int default 5) returns table(...)
+pg_retrieval_engine_embedding_job_complete(job_id bigint, embedding vector, metadata jsonb default '{}'::jsonb, expected_attempt int default null, worker_id text default null) returns void
+pg_retrieval_engine_embedding_job_fail(job_id bigint, error_message text, metadata jsonb default '{}'::jsonb, expected_attempt int default null, worker_id text default null) returns void
+pg_retrieval_engine_activate_embedding_version(embedding_version_id bigint, tenant_id text default null) returns integer
 ```
 
-The extension stores extracted text, structured chunks, parent-child links, metadata, citation metadata, embedding versions, and incremental embedding jobs. Binary PDF/HTML parsing and embedding model execution stay outside PostgreSQL.
+The extension stores tenant-scoped extracted text, stable structured chunks, parent-child links, metadata, ACL JSONB, citation metadata, embedding versions, versioned chunk embeddings, and incremental embedding jobs. Binary PDF/HTML parsing and embedding model execution stay outside PostgreSQL.
+
+`pg_retrieval_engine_document_upsert` reads optional `metadata.tenant_id` and `metadata.acl`. The uniqueness key is `(tenant_id, source_uri)`. Tenant IDs are constrained to `^[A-Za-z0-9_.:-]{1,128}$` to keep tenant filters predictable across SQL and worker paths.
+
+`pg_retrieval_engine_chunk_document` upserts chunks by `(document_id, chunk_type, chunk_no)` instead of deleting and reinserting all rows. Reused positions keep their chunk IDs. If chunk content changes, the latest `embedding` on `pg_retrieval_engine_chunks` is cleared so workers can re-embed safely.
+
+`pg_retrieval_engine_claim_embedding_jobs` uses `FOR UPDATE SKIP LOCKED` to lease pending, failed, or timed-out running jobs and increments `attempts`. It returns the current chunk content hash, refreshing stale job hashes at claim time when a chunk has changed. `lease_timeout_seconds` controls stale running job takeover and `max_attempts` prevents endless retry loops.
+
+`pg_retrieval_engine_embedding_job_complete` requires a claimed `running` job, validates optional `expected_attempt`/`worker_id` fencing, stale content hashes, and `vector_dims(embedding)` against the embedding version, then updates the latest chunk vector and upserts `pg_retrieval_engine_chunk_embeddings`.
+
+`pg_retrieval_engine_embedding_job_fail` records retry diagnostics, supports the same optional fencing, and clears the job lease. `pg_retrieval_engine_activate_embedding_version` promotes current versioned embeddings for one version, optionally scoped to one tenant, into `pg_retrieval_engine_chunks.embedding` for the production search path.
 
 ```sql
 pg_retrieval_engine_pgvector_index_create(table_name regclass, vector_column name, index_type text, opclass text default 'vector_cosine_ops', options jsonb default '{}'::jsonb) returns text
@@ -229,10 +249,82 @@ Supported `options`:
 - `vector_operator`: `<=>` (default, cosine distance) / `<->` (L2) / `<#>` (negative inner product)
 - `rank_function`: `ts_rank_cd` (default) / `ts_rank`
 - `normalization`: full-text rank normalization, default `32`
+- `tenant_id`: equality filter against a `tenant_id` column
+- `namespace`: JSONB metadata namespace equality, intended for Agent/RAG collections
+- `agent_id`: allow only rows whose ACL `agents` list is absent or contains this agent
+- `user_id`: allow only rows whose ACL `users` list is absent or contains this user
+- `user_roles` / `allowed_roles`: allow only rows whose ACL `roles` list is absent or overlaps these roles
+- `sensitivity_max`: maximum allowed sensitivity, one of `public`, `internal`, `confidential`, `restricted`
 - `filters`: scalar column equality filters, for example `{"tenant_id":"acme"}`
+- `filters` also accepts simple operator objects:
+  `{"status":{"op":"in","value":["active","draft"]}}`,
+  `{"deleted_at":{"op":"is_null","value":true}}`,
+  `{"properties":{"op":"contains","value":{"doc_type":"manual"}}}`
+- operator objects must include `value` for `eq`, `ne`, `in`, and `contains`; use `is_null` for null checks
 - `metadata_column`: JSONB metadata column name, default `metadata`
 - `metadata_filter`: JSONB containment filter applied as `metadata_column @> metadata_filter`
+- `acl_column`: JSONB ACL column name, default `acl`
+- `acl_filter`: JSONB containment filter applied as `acl_column @> acl_filter`
 - `soft_delete_column`: nullable timestamp/marker column that must be `NULL`
+
+Permission-aware Agent retrieval should pass the top-level permission fields instead of relying only on similarity. For example:
+
+```json
+{
+  "tenant_id": "acme",
+  "agent_id": "dba-copilot",
+  "user_id": "alice",
+  "user_roles": ["dba"],
+  "namespace": "postgres_runbook",
+  "sensitivity_max": "internal"
+}
+```
+
+### 3.10.1 `pg_retrieval_engine_hybrid_search_batch`
+
+```sql
+pg_retrieval_engine_hybrid_search_batch(
+  table_name regclass,
+  id_column name,
+  vector_column name,
+  tsvector_column name,
+  query_vectors vector[],
+  query_tsqueries tsquery[],
+  k int,
+  options jsonb default '{}'::jsonb
+) returns table(query_no int, id bigint, rrf_score double precision, vector_rank int, fts_rank int, vector_distance real, fts_score real)
+```
+
+Runs the same hybrid retrieval contract for multiple query vectors and tsqueries. The current implementation is a SQL wrapper around `pg_retrieval_engine_hybrid_search`; it is intended for API ergonomics and evaluation exports, not yet a shared executor-level optimization.
+
+### 3.10.2 `pg_retrieval_engine_search_chunks`
+
+```sql
+pg_retrieval_engine_search_chunks(
+  query_vector vector,
+  query_tsquery tsquery,
+  k int,
+  options jsonb default '{}'::jsonb
+) returns table(
+  chunk_id bigint,
+  document_id bigint,
+  parent_chunk_id bigint,
+  chunk_type text,
+  content text,
+  context_content text,
+  metadata jsonb,
+  citation_metadata jsonb,
+  rrf_score double precision,
+  vector_rank int,
+  fts_rank int,
+  vector_distance real,
+  fts_score real
+)
+```
+
+Searches `pg_retrieval_engine_chunks`, forces `chunk_type='child'`, and returns content, optional parent context, metadata, citations, and ranking diagnostics. Supported extra option:
+
+- `return_parent`: when `true`, `context_content` is the parent chunk content when available; otherwise it is the child content.
 
 ### 3.11 `pg_retrieval_engine_hybrid_search_faiss`
 
@@ -316,6 +408,8 @@ pg_retrieval_engine_retrieval_explain(
 ```
 
 Returns stage counts, candidate overlap, filter diagnostics, optional latency hints, recalled/missing relevant IDs, and `likely_failure_reason`.
+
+For Agent debugging this output is the retrieval trace source. A trace page can show the user query, retrieval options, dense top K, sparse top K, RRF overlap, rerank result, filtered-out documents when exported by the caller, final context, and likely failure reason.
 
 ### 3.14 `pg_retrieval_engine_hybrid_autotune`
 

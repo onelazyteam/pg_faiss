@@ -1,0 +1,3 @@
+# qid	doc_id	relevance
+agent-q1	file:///runbooks/replication-lag.md	2
+agent-q2	file:///runbooks/vacuum-bloat.md	2
